@@ -83,6 +83,33 @@ html[data-theme-mode="dark"] img[src^="assets/drawio-"] {
     filter: invert(0.8) brightness(1.2);
 }
 
-div[data-type='NodeParagraph']:not(:hover) .protyle-attr .label--embed-drawio:not(.label--embed-drawio--always) {
-  display: none !important;
+div[data-type='NodeParagraph'] .img[data-type='img'][data-drawnix-label] {
+    position: relative;
+    display: inline-block;
+    vertical-align: top;
+    line-height: 0;
+    max-width: 100%;
+}
+
+div[data-type='NodeParagraph'] .img[data-type='img'][data-drawnix-label]::before {
+    content: attr(data-drawnix-label);
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    max-width: calc(100% - 16px);
+    display: block;
+    padding: 2px 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 2;
+    line-height: 1.4;
+    border-radius: 6px;
+    background: var(--b3-theme-background);
+    box-shadow: 0 0 0 1px var(--b3-border-color);
+}
+
+div[data-type='NodeParagraph']:not(:hover) .img[data-type='img'][data-drawnix-label][data-drawnix-label-mode='hover']::before {
+    content: none;
 }

@@ -115,6 +115,77 @@ export function arrayToBase64(array: Uint8Array): string {
   return btoa(binary);
 }
 
+const DRAWNIX_SVG_ATTR = 'data-drawnix';
+const DRAWNIX_PNG_KEYWORD = 'drawnix';
+
+function updateUint8ArrayRange(
+  srcArray: Uint8Array,
+  targetArray: Uint8Array,
+  targetLocation: { index: number; length: number },
+): Uint8Array {
+  const { index: targetIndex, length: targetLength } = targetLocation;
+  const newLength = targetArray.length - targetLength + srcArray.length;
+  const result = new Uint8Array(newLength);
+
+  result.set(targetArray.subarray(0, targetIndex), 0);
+  result.set(srcArray, targetIndex);
+  result.set(
+    targetArray.subarray(targetIndex + targetLength),
+    targetIndex + srcArray.length,
+  );
+
+  return result;
+}
+
+function getPNGChunkInfo(data: Uint8Array, chunkType?: string, keyword?: string): { index: number; length: number } | null {
+  if (data.length < 8) return null;
+
+  const pngSignature = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  for (let i = 0; i < 8; i++) {
+    if (data[i] !== pngSignature[i]) {
+      return null;
+    }
+  }
+
+  let offset = 8;
+
+  while (offset <= data.length - 12) {
+    const length = (
+      (data[offset] << 24) |
+      (data[offset + 1] << 16) |
+      (data[offset + 2] << 8) |
+      data[offset + 3]
+    ) >>> 0;
+
+    if (offset + 12 + length > data.length) break;
+
+    const typeBytes = data.subarray(offset + 4, offset + 8);
+    const typeStr = String.fromCharCode(...typeBytes);
+    if (chunkType && typeStr !== chunkType) {
+      offset += 12 + length;
+      continue;
+    }
+
+    if (keyword && typeStr === 'tEXt') {
+      const chunkData = data.subarray(offset + 8, offset + 8 + length);
+      const separatorIndex = chunkData.indexOf(0);
+      if (separatorIndex < 0) {
+        offset += 12 + length;
+        continue;
+      }
+      const foundKeyword = String.fromCharCode(...chunkData.subarray(0, separatorIndex));
+      if (foundKeyword !== keyword) {
+        offset += 12 + length;
+        continue;
+      }
+    }
+
+    return { index: offset, length: 12 + length };
+  }
+
+  return null;
+}
+
 function getPNGSizeFromBase64(dataUrl: string): { width: number, height: number } | null {
   // 1. 检查是否是 PNG Data URL
   if (!dataUrl.startsWith('data:image/png;base64,')) {
@@ -249,46 +320,136 @@ export function getImageSizeFromBase64(dataUrl: string): { width: number, height
 }
 
 export function locatePNGtEXt(data: Uint8Array): { index: number; length: number } | null {
-  if (data.length < 8) return null;
+  return getPNGChunkInfo(data, 'tEXt');
+}
 
-  // 检查 PNG 文件头（可选，但推荐）
-  const pngSignature = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  for (let i = 0; i < 8; i++) {
-    if (data[i] !== pngSignature[i]) {
-      return null; // 不是合法 PNG
+export function embedDrawnixMetadata(imageDataURL: string, drawnixData: string): string {
+  if (!drawnixData) return imageDataURL;
+
+  const metadataBase64 = unicodeToBase64(drawnixData);
+
+  if (imageDataURL.startsWith('data:image/svg+xml;base64,')) {
+    const base64String = imageDataURL.split(',').pop();
+    const svgContent = base64ToUnicode(base64String);
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(svgContent, 'image/svg+xml');
+    const svgElement = doc.documentElement;
+    if (svgElement?.tagName?.toLowerCase() !== 'svg') return imageDataURL;
+
+    svgElement.setAttribute(DRAWNIX_SVG_ATTR, metadataBase64);
+    const serialized = new XMLSerializer().serializeToString(svgElement);
+    return `data:image/svg+xml;base64,${unicodeToBase64(serialized)}`;
+  }
+
+  if (imageDataURL.startsWith('data:image/png;base64,')) {
+    const binaryArray = base64ToArray(imageDataURL.split(',').pop());
+    const keywordBytes = new TextEncoder().encode(DRAWNIX_PNG_KEYWORD);
+    const textBytes = new TextEncoder().encode(metadataBase64);
+    const chunkData = new Uint8Array(keywordBytes.length + 1 + textBytes.length);
+    chunkData.set(keywordBytes, 0);
+    chunkData[keywordBytes.length] = 0;
+    chunkData.set(textBytes, keywordBytes.length + 1);
+
+    const chunkLength = new Uint8Array(4);
+    chunkLength[0] = (chunkData.length >> 24) & 0xff;
+    chunkLength[1] = (chunkData.length >> 16) & 0xff;
+    chunkLength[2] = (chunkData.length >> 8) & 0xff;
+    chunkLength[3] = chunkData.length & 0xff;
+
+    const chunkType = new Uint8Array([0x74, 0x45, 0x58, 0x74]); // tEXt
+    const crcBuffer = new Uint8Array(chunkType.length + chunkData.length);
+    crcBuffer.set(chunkType, 0);
+    crcBuffer.set(chunkData, chunkType.length);
+    const crc = crc32(crcBuffer);
+
+    const crcBytes = new Uint8Array(4);
+    crcBytes[0] = (crc >> 24) & 0xff;
+    crcBytes[1] = (crc >> 16) & 0xff;
+    crcBytes[2] = (crc >> 8) & 0xff;
+    crcBytes[3] = crc & 0xff;
+
+    const chunk = new Uint8Array(4 + 4 + chunkData.length + 4);
+    chunk.set(chunkLength, 0);
+    chunk.set(chunkType, 4);
+    chunk.set(chunkData, 8);
+    chunk.set(crcBytes, 8 + chunkData.length);
+
+    const existingChunk = getPNGChunkInfo(binaryArray, 'tEXt', DRAWNIX_PNG_KEYWORD);
+    let result: Uint8Array;
+    if (existingChunk) {
+      result = updateUint8ArrayRange(chunk, binaryArray, existingChunk);
+    } else {
+      let ihdrEnd = -1;
+      let offset = 8;
+      while (offset <= binaryArray.length - 12) {
+        const length = (
+          (binaryArray[offset] << 24) |
+          (binaryArray[offset + 1] << 16) |
+          (binaryArray[offset + 2] << 8) |
+          binaryArray[offset + 3]
+        ) >>> 0;
+        if (offset + 12 + length > binaryArray.length) break;
+
+        const typeBytes = binaryArray.subarray(offset + 4, offset + 8);
+        const typeStr = String.fromCharCode(...typeBytes);
+        if (typeStr === 'IHDR') {
+          ihdrEnd = offset + 12 + length;
+          break;
+        }
+        offset += 12 + length;
+      }
+
+      if (ihdrEnd === -1) return imageDataURL;
+
+      result = new Uint8Array(binaryArray.length + chunk.length);
+      result.set(binaryArray.subarray(0, ihdrEnd), 0);
+      result.set(chunk, ihdrEnd);
+      result.set(binaryArray.subarray(ihdrEnd), ihdrEnd + chunk.length);
+    }
+
+    return `data:image/png;base64,${arrayToBase64(result)}`;
+  }
+
+  return imageDataURL;
+}
+
+export function extractDrawnixMetadata(imageDataURL: string): string | null {
+  if (imageDataURL.startsWith('data:image/svg+xml;base64,')) {
+    const base64String = imageDataURL.split(',').pop();
+    const svgContent = base64ToUnicode(base64String);
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(svgContent, 'image/svg+xml');
+    const svgElement = doc.documentElement;
+    const metadataBase64 = svgElement?.getAttribute?.(DRAWNIX_SVG_ATTR);
+    if (!metadataBase64) return null;
+
+    try {
+      return base64ToUnicode(metadataBase64);
+    } catch {
+      return null;
     }
   }
 
-  let offset = 8; // 跳过签名
+  if (imageDataURL.startsWith('data:image/png;base64,')) {
+    const binaryArray = base64ToArray(imageDataURL.split(',').pop());
+    const chunkInfo = getPNGChunkInfo(binaryArray, 'tEXt', DRAWNIX_PNG_KEYWORD);
+    if (!chunkInfo) return null;
 
-  while (offset <= data.length - 12) {
-    // 读取 Length（大端序，4字节）
-    const length = (
-      (data[offset] << 24) |
-      (data[offset + 1] << 16) |
-      (data[offset + 2] << 8) |
-      data[offset + 3]
-    ) >>> 0;
+    const dataLength = chunkInfo.length - 12;
+    const chunkData = binaryArray.subarray(chunkInfo.index + 8, chunkInfo.index + 8 + dataLength);
+    const separatorIndex = chunkData.indexOf(0);
+    if (separatorIndex < 0) return null;
 
-    // 检查是否超出文件边界
-    if (offset + 12 + length > data.length) {
-      break; // chunk 不完整
+    const metadataBytes = chunkData.subarray(separatorIndex + 1);
+    const metadataBase64 = new TextDecoder().decode(metadataBytes);
+    try {
+      return base64ToUnicode(metadataBase64);
+    } catch {
+      return null;
     }
-
-    // 读取 Chunk Type（4字节）
-    const typeBytes = data.subarray(offset + 4, offset + 8);
-    const typeStr = String.fromCharCode(...typeBytes);
-
-    if (typeStr === 'tEXt') {
-      // 找到 tEXt chunk
-      return { index: offset, length: 12 + length };
-    }
-
-    // 跳到下一个 chunk（12 = 4 Length + 4 Type + 4 CRC）
-    offset += 12 + length;
   }
 
-  return null; // 未找到 tEXt
+  return null;
 }
 
 export function replaceSubArray(

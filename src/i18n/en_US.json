@@ -13,5 +13,12 @@
   "editWindow": "Edit Window Mode",
   "editWindowDescription": "The type of window for editing draw.io",
   "themeMode": "Theme Mode",
-  "themeModeDescription": "Theme of window"
+  "themeModeDescription": "Theme of window",
+  "exportXmind": "Export as XMind",
+  "exportFile": "Export File",
+  "exportOPML": "Export OPML",
+  "exportMarkdown": "Export Markdown",
+  "noTextToExport": "No text to export",
+  "exportFailed": "Export failed",
+  "exportSuccess": "Exported"
 }

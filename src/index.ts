@@ -23,9 +23,16 @@ import {
   unicodeToBase64,
   blobToDataURL,
   dataURLToBlob,
+  embedDrawnixMetadata,
+  extractDrawnixMetadata,
   HTMLToElement,
 } from "./utils";
 import { matchHotKey } from "./utils/hotkey";
+import {
+  buildXmindImportFile,
+  extractFlatTopics,
+  type XmindImportFormat,
+} from "./utils/xmind";
 import defaultImageContent from "@/default.json";
 
 
@@ -83,6 +90,7 @@ export default class DrawnixPlugin extends Plugin {
   private _globalKeyDownHandler;
   private _mouseOverHandler;
   private isMouseOverProcessing = false;
+  private fullLabelRefreshTimer: number | null = null;
 
   private settingItems: SettingItem[];
   public EDIT_TAB_TYPE = "drawnix-edit-tab";
@@ -96,19 +104,12 @@ export default class DrawnixPlugin extends Plugin {
 
   async onload() {
     this.initMetaInfo();
-    this.initSetting();
+    await this.initSetting();
 
-    this._mutationObserver = this.setAddImageBlockMuatationObserver(document.body, (blockElement: HTMLElement) => {
-      if (this.data[STORAGE_NAME].labelDisplay === "noLabel") return;
-
-      const imageElement = blockElement.querySelector("img") as HTMLImageElement;
-      if (imageElement) {
-        const imageURL = imageElement.getAttribute("data-src");
-        this.getDrawnixImageInfo(imageURL, blockElement).then((imageInfo) => {
-          this.updateAttrLabel(imageInfo, blockElement);
-        });
-      }
+    this._mutationObserver = this.setAddImageBlockMuatationObserver(document.body, () => {
+      this.scheduleFullDrawnixLabelRefresh();
     });
+    this.scheduleFullDrawnixLabelRefresh(0);
 
     this.setupEditTab();
 
@@ -225,6 +226,7 @@ export default class DrawnixPlugin extends Plugin {
       this.data[STORAGE_NAME].embedImageFormat = (dialog.element.querySelector("[data-type='embedImageFormat']") as HTMLSelectElement).value;
       this.data[STORAGE_NAME].editWindow = (dialog.element.querySelector("[data-type='editWindow']") as HTMLSelectElement).value;
       this.saveData(STORAGE_NAME, this.data[STORAGE_NAME]);
+      this.scheduleFullDrawnixLabelRefresh(0);
       this.reloadAllEditor();
       this.removeAllDrawnixTab();
       dialog.destroy();
@@ -298,36 +300,44 @@ export default class DrawnixPlugin extends Plugin {
     }
   }
 
-  public setAddImageBlockMuatationObserver(element: HTMLElement, callback: (blockElement: HTMLElement) => void): MutationObserver {
+  public setAddImageBlockMuatationObserver(element: HTMLElement, callback: () => void): MutationObserver {
     const mutationObserver = new MutationObserver(mutations => {
-      for (const mutation of mutations) {
-        if (mutation.type === 'childList') {
-          mutation.addedNodes.forEach(node => {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              const addedElement = node as HTMLElement;
-              if (addedElement.matches("div[data-type='NodeParagraph']")) {
-                if (addedElement.querySelector(".img[data-type='img'] img")) {
-                  callback(addedElement as HTMLElement);
-                }
-              } else {
-                addedElement.querySelectorAll("div[data-type='NodeParagraph']").forEach((blockElement: HTMLElement) => {
-                  if (blockElement.querySelector(".img[data-type='img'] img")) {
-                    callback(blockElement);
-                  }
-                })
-              }
-            }
+      const isRelevantElement = (elementNode: Element) => {
+        return elementNode.matches("div[data-type='NodeParagraph'], .img[data-type='img'], img")
+          || !!elementNode.querySelector("div[data-type='NodeParagraph'], .img[data-type='img'], img");
+      };
+
+      const hasRelevantMutation = mutations.some((mutation) => {
+        if (mutation.type === 'attributes') {
+          return true;
+        }
+
+        if (!(mutation.target instanceof Element) || !mutation.target.closest("div[data-type='NodeParagraph']")) {
+          return [...mutation.addedNodes, ...mutation.removedNodes].some((node) => {
+            return node instanceof Element && isRelevantElement(node);
           });
         }
+
+        return true;
+      });
+
+      if (hasRelevantMutation) {
+        callback();
       }
     });
 
     mutationObserver.observe(element, {
       childList: true,
-      subtree: true
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-src", "src", "custom-drawnix"],
     });
 
     return mutationObserver;
+  }
+
+  private isDrawnixAssetURL(imageURL: string): boolean {
+    return /^assets\/drawnix-image-.+\.(?:svg|png)$/i.test(imageURL || '');
   }
 
   public async getDrawnixImageInfo(imageURL: string, blockElement?: HTMLElement): Promise<DrawnixImageInfo | null> {
@@ -353,6 +363,9 @@ export default class DrawnixPlugin extends Plugin {
 
     if (!blockID) return null;
 
+    const imageContent = await this.getDrawnixImage(imageURL, true);
+    if (!imageContent) return null;
+
     // If we didn't find drawnix data in DOM, try API (fallback)
     if (!drawnixData) {
       const customAttr = await this.getBlockAttrs(blockID);
@@ -361,10 +374,18 @@ export default class DrawnixPlugin extends Plugin {
       }
     }
 
-    if (!drawnixData) return null;
+    if (!drawnixData) {
+      drawnixData = extractDrawnixMetadata(imageContent) || '';
+      if (drawnixData && blockID) {
+        try {
+          await fetchSyncPost('/api/attr/setBlockAttrs', { id: blockID, attrs: { 'custom-drawnix': drawnixData } });
+        } catch (err) {
+          console.error('Failed to restore drawnix metadata from image', err);
+        }
+      }
+    }
 
-    const imageContent = await this.getDrawnixImage(imageURL, true);
-    if (!imageContent) return null;
+    if (!drawnixData) return null;
 
     const imageInfo: DrawnixImageInfo = {
       blockID: blockID,
@@ -388,7 +409,25 @@ export default class DrawnixPlugin extends Plugin {
   public async newDrawnixImage(protyle: any, blockID: string, callback?: (imageInfo: DrawnixImageInfo) => void) {
     const format = this.data[STORAGE_NAME].embedImageFormat;
     const imageName = `drawnix-image-${window.Lute.NewNodeID()}.${format}`;
-    const placeholderImageContent = this.getPlaceholderImageContent(format);
+    const defaultDrawnixData = {
+      "type": "drawnix",
+      "version": 1,
+      "source": "web",
+      "children": [
+
+      ],
+      "viewport": {
+        "zoom": 0.8920378279589448,
+        "origination": [
+          -345.4451339703334,
+          -273.8101350501055
+        ]
+      }
+    };
+    const placeholderImageContent = embedDrawnixMetadata(
+      this.getPlaceholderImageContent(format),
+      JSON.stringify(defaultDrawnixData),
+    );
     const blob = dataURLToBlob(placeholderImageContent);
     const file = new File([blob], imageName, { type: blob.type });
     const formData = new FormData();
@@ -398,21 +437,6 @@ export default class DrawnixPlugin extends Plugin {
     await fetchSyncPost('/api/file/putFile', formData);
       const imageURL = `assets/${imageName}`;
       protyle.insert(`![](${imageURL})`);
-      const defaultDrawnixData = {
-        "type": "drawnix",
-        "version": 1,
-        "source": "web",
-        "children": [
-
-        ],
-        "viewport": {
-          "zoom": 0.8920378279589448,
-          "origination": [
-            -345.4451339703334,
-            -273.8101350501055
-          ]
-        }
-      };
       // 将初始的 drawnix 数据写入块属性，参考 mindmap 插件的实现方式
       if (blockID) {
         try {
@@ -454,6 +478,9 @@ export default class DrawnixPlugin extends Plugin {
     if (!imageData || imageData.trim() === '') {
       imageData = this.getPlaceholderImageContent(imageInfo.format);
     }
+    if (imageInfo.drawnixData) {
+      imageData = embedDrawnixMetadata(imageData, imageInfo.drawnixData);
+    }
 
     const blob = dataURLToBlob(imageData);
     const file = new File([blob], imageInfo.imageURL.split('/').pop(), { type: blob.type });
@@ -465,10 +492,8 @@ export default class DrawnixPlugin extends Plugin {
       // Save drawnix data to block attributes
       if (imageInfo.drawnixData) {
         try {
-          const parsedData = JSON.parse(imageInfo.drawnixData);
-          if (parsedData.children && parsedData.children.length > 0) {
-            await fetchSyncPost('/api/attr/setBlockAttrs', { id: imageInfo.blockID, attrs: { 'custom-drawnix': imageInfo.drawnixData } });
-          }
+          JSON.parse(imageInfo.drawnixData);
+          await fetchSyncPost('/api/attr/setBlockAttrs', { id: imageInfo.blockID, attrs: { 'custom-drawnix': imageInfo.drawnixData } });
         } catch (e) {
           console.error("Failed to parse drawnix data", e);
         }
@@ -476,27 +501,122 @@ export default class DrawnixPlugin extends Plugin {
     if (callback) callback(response);
   }
 
-  public updateAttrLabel(imageInfo: DrawnixImageInfo, blockElement: HTMLElement) {
-    if (!imageInfo) return;
+  private getDrawnixDisplayName(imageInfo: DrawnixImageInfo): string {
+    if (!imageInfo?.drawnixData) return "Drawnix";
 
+    try {
+      const boardData = JSON.parse(imageInfo.drawnixData);
+      const firstTopic = extractFlatTopics(boardData)[0];
+      return firstTopic || "Drawnix";
+    } catch (err) {
+      console.error("Failed to parse drawnix display name", err);
+      return "Drawnix";
+    }
+  }
+
+  private clearDrawnixLabel(blockElement: HTMLElement) {
+    const imgContainer = blockElement.querySelector(".img[data-type='img']") as HTMLDivElement;
+    if (imgContainer) {
+      imgContainer.removeAttribute("data-drawnix-label");
+      imgContainer.removeAttribute("data-drawnix-label-mode");
+    }
+
+    blockElement.querySelectorAll(".label--embed-drawnix").forEach((labelElement) => {
+      labelElement.remove();
+    });
+    blockElement.querySelectorAll(".drawnix-image-container").forEach((containerElement) => {
+      containerElement.classList.remove("drawnix-image-container");
+    });
+  }
+
+  private clearAllDrawnixLabels(root: ParentNode = document) {
+    root.querySelectorAll(".img[data-type='img']").forEach((containerElement) => {
+      (containerElement as HTMLDivElement).removeAttribute("data-drawnix-label");
+      (containerElement as HTMLDivElement).removeAttribute("data-drawnix-label-mode");
+    });
+    root.querySelectorAll(".label--embed-drawnix").forEach((labelElement) => {
+      labelElement.remove();
+    });
+    root.querySelectorAll(".drawnix-image-container").forEach((containerElement) => {
+      containerElement.classList.remove("drawnix-image-container");
+    });
+  }
+
+  private collectDrawnixLabelBlocks(root: ParentNode = document): HTMLElement[] {
+    const blockSet = new Set<HTMLElement>();
+
+    root.querySelectorAll(".img[data-type='img'] img").forEach((imageElement) => {
+      const img = imageElement as HTMLImageElement;
+      const imageURL = img.getAttribute("data-src") || img.getAttribute("src") || "";
+      if (!this.isDrawnixAssetURL(imageURL)) return;
+
+      const blockElement = img.closest("div[data-type='NodeParagraph']") as HTMLElement;
+      if (blockElement) {
+        blockSet.add(blockElement);
+      }
+    });
+
+    return Array.from(blockSet);
+  }
+
+  private scheduleFullDrawnixLabelRefresh(delay = 80) {
+    if (this.fullLabelRefreshTimer !== null) {
+      window.clearTimeout(this.fullLabelRefreshTimer);
+    }
+
+    this.fullLabelRefreshTimer = window.setTimeout(() => {
+      this.fullLabelRefreshTimer = null;
+      this.refreshAllDrawnixLabels();
+    }, delay);
+  }
+
+  private async refreshAllDrawnixLabels() {
+    this.clearAllDrawnixLabels();
+
+    if (this.data[STORAGE_NAME].labelDisplay === "noLabel") {
+      return;
+    }
+
+    const blockElements = this.collectDrawnixLabelBlocks();
+    await Promise.allSettled(blockElements.map((blockElement) => this.syncDrawnixLabel(blockElement)));
+  }
+
+  private async syncDrawnixLabel(blockElement: HTMLElement) {
+    if (!blockElement?.isConnected) return;
+
+    const imgContainer = blockElement.querySelector(".img[data-type='img']") as HTMLDivElement;
+    const imageElement = imgContainer?.querySelector("img") as HTMLImageElement;
+    const imageURL = imageElement?.getAttribute("data-src") || imageElement?.getAttribute("src") || "";
+
+    if (this.data[STORAGE_NAME].labelDisplay === "noLabel" || !imgContainer || !this.isDrawnixAssetURL(imageURL)) {
+      this.clearDrawnixLabel(blockElement);
+      return;
+    }
+
+    const imageInfo = await this.getDrawnixImageInfo(imageURL, blockElement);
+    if (!blockElement.isConnected) return;
+
+    if (!imageInfo) {
+      this.clearDrawnixLabel(blockElement);
+      return;
+    }
+
+    this.updateAttrLabel(imageInfo, blockElement);
+  }
+
+  public updateAttrLabel(imageInfo: DrawnixImageInfo, blockElement: HTMLElement) {
+    this.clearDrawnixLabel(blockElement);
+
+    if (!imageInfo) return;
     if (this.data[STORAGE_NAME].labelDisplay === "noLabel") return;
 
-    const attrElement = blockElement.querySelector(".protyle-attr") as HTMLDivElement;
-    if (attrElement) {
-      const labelHTML = `<span>Drawnix</span>`;
-      let labelElement = attrElement.querySelector(".label--embed-drawnix") as HTMLDivElement;
-      if (labelElement) {
-        labelElement.innerHTML = labelHTML;
-      } else {
-        labelElement = document.createElement("div");
-        labelElement.classList.add("label--embed-drawnix");
-        if (this.data[STORAGE_NAME].labelDisplay === "showLabelAlways") {
-          labelElement.classList.add("label--embed-drawnix--always");
-        }
-        labelElement.innerHTML = labelHTML;
-        attrElement.prepend(labelElement);
-      }
-    }
+    const imgContainer = blockElement.querySelector(".img[data-type='img']") as HTMLDivElement;
+    if (!imgContainer) return;
+
+    const displayName = this.getDrawnixDisplayName(imageInfo);
+    const labelMode = this.data[STORAGE_NAME].labelDisplay === "showLabelAlways" ? "always" : "hover";
+    imgContainer.setAttribute("data-drawnix-label", displayName);
+    imgContainer.setAttribute("data-drawnix-label-mode", labelMode);
   }
 
   private mouseOverHandler(e: MouseEvent) {
@@ -512,8 +632,9 @@ export default class DrawnixPlugin extends Plugin {
     const blockElement = imgContainer.closest('[data-node-id]') as HTMLElement;
     if (!blockElement) return;
 
-    // Check if it is a drawnix block
-    if (!blockElement.getAttribute("custom-drawnix")) return;
+    const imgElement = imgContainer.querySelector('img') as HTMLImageElement;
+    const imageURL = imgElement?.getAttribute("data-src") || imgElement?.getAttribute("src") || '';
+    if (!this.isDrawnixAssetURL(imageURL)) return;
 
     const action = imgContainer.querySelector('.protyle-action');
     if (!action) return;
@@ -538,9 +659,6 @@ export default class DrawnixPlugin extends Plugin {
     const editBtn = imgContainer.querySelector('.cst-edit-drawnix');
     editBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-
-      const imgElement = imgContainer.querySelector('img') as HTMLImageElement;
-      const imageURL = imgElement?.getAttribute("data-src") || imgElement?.getAttribute("src");
 
       if (imageURL) {
         this.getDrawnixImageInfo(imageURL, blockElement).then((imageInfo) => {
@@ -628,6 +746,447 @@ export default class DrawnixPlugin extends Plugin {
     this.tabHotKeyEventHandler(event);
   };
 
+  private getI18nText(key: string, fallback: string): string {
+    return this.i18n?.[key] || fallback;
+  }
+
+  private pushNotification(msg: string, timeout = 3000) {
+    try {
+      fetchPost('/api/notification/pushMsg', {
+        msg,
+        timeout,
+      });
+    } catch (err) {
+      console.error('Failed to send notification', err);
+    }
+  }
+
+  private parseMessageData(data: any): any {
+    if (typeof data !== 'string') return data;
+    try {
+      return JSON.parse(data);
+    } catch {
+      return null;
+    }
+  }
+
+  private requestDrawnixSource(iframe: HTMLIFrameElement): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!iframe.contentWindow) {
+        reject(new Error('Drawnix iframe is not ready'));
+        return;
+      }
+
+      const requestId = `xmind-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const timeout = window.setTimeout(() => {
+        cleanup();
+        reject(new Error('Drawnix source export timed out'));
+      }, 3000);
+
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        window.removeEventListener('message', messageEventHandler);
+      };
+
+      const messageEventHandler = (event: MessageEvent) => {
+        if (event.source !== iframe.contentWindow) return;
+
+        const message = this.parseMessageData(event.data);
+        if (message?.type !== 'export-source' || message.requestId !== requestId) return;
+
+        cleanup();
+        resolve(message.data);
+      };
+
+      window.addEventListener('message', messageEventHandler);
+      iframe.contentWindow.postMessage({
+        type: 'export-source',
+        requestId,
+      }, '*');
+    });
+  }
+
+  private downloadTextFile(fileName: string, content: string, mimeType: string) {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  private async exportXmindImportFile(
+    iframe: HTMLIFrameElement,
+    imageInfo: DrawnixImageInfo,
+    format: XmindImportFormat,
+  ) {
+    try {
+      const sourceData = await this.requestDrawnixSource(iframe);
+      if (sourceData) {
+        imageInfo.drawnixData = JSON.stringify(sourceData);
+      }
+
+      const file = buildXmindImportFile(sourceData, imageInfo.imageURL, format);
+      if (file.topics.length === 0) {
+        this.pushNotification(this.getI18nText('noTextToExport', '没有可导出的文本'));
+        return;
+      }
+
+      this.downloadTextFile(file.fileName, file.content, file.mimeType);
+      this.pushNotification(`${this.getI18nText('exportSuccess', '导出成功')}: ${file.fileName}`);
+    } catch (err) {
+      console.error('Failed to export XMind import file', err);
+      this.pushNotification(this.getI18nText('exportFailed', '导出失败'));
+    }
+  }
+
+  private closeXmindExportMenu(doc: Document) {
+    const menu = doc.querySelector('.customXmindExportMenu') as (HTMLElement & {
+      __cleanup?: () => void;
+    }) | null;
+
+    if (menu?.__cleanup) {
+      menu.__cleanup();
+      return;
+    }
+
+    menu?.remove();
+  }
+
+  private positionXmindExportMenu(menu: HTMLElement, anchor: HTMLElement, doc: Document) {
+    const viewportWidth = doc.documentElement.clientWidth;
+    const viewportHeight = doc.documentElement.clientHeight;
+    const anchorRect = anchor.getBoundingClientRect();
+    const gap = 4;
+    const maxLeft = Math.max(gap, viewportWidth - menu.offsetWidth - gap);
+    const maxTop = Math.max(gap, viewportHeight - menu.offsetHeight - gap);
+    const isNativeMenuItem = anchor.classList.contains('menu-item');
+
+    let left = anchorRect.left;
+    let top = anchorRect.bottom + gap;
+
+    if (isNativeMenuItem) {
+      left = anchorRect.right + gap;
+      top = anchorRect.top;
+
+      if (left > maxLeft) {
+        left = anchorRect.left - menu.offsetWidth - gap;
+      }
+    }
+
+    menu.style.left = `${Math.min(Math.max(gap, left), maxLeft)}px`;
+    menu.style.top = `${Math.min(Math.max(gap, top), maxTop)}px`;
+  }
+
+  private createMenuIcon(doc: Document, svgMarkup: string) {
+    const icon = doc.createElement('span');
+    icon.setAttribute('aria-hidden', 'true');
+    icon.style.display = 'inline-flex';
+    icon.style.alignItems = 'center';
+    icon.style.justifyContent = 'center';
+    icon.style.width = '1rem';
+    icon.style.height = '1rem';
+    icon.style.flex = '0 0 auto';
+    icon.innerHTML = svgMarkup;
+    return icon;
+  }
+
+  private createMenuItemLabel(doc: Document, label: string, svgMarkup?: string) {
+    const text = doc.createElement('span');
+    text.className = 'menu-item__text';
+
+    if (svgMarkup) {
+      text.appendChild(this.createMenuIcon(doc, svgMarkup));
+    }
+
+    const labelText = doc.createElement('span');
+    labelText.textContent = label;
+    text.appendChild(labelText);
+    return text;
+  }
+
+  private createMenuItem(
+    doc: Document,
+    options: {
+      label: string;
+      icon?: string;
+      shortcutText?: string;
+      shortcutIcon?: string;
+      className?: string;
+      title?: string;
+    },
+  ) {
+    const item = doc.createElement('button');
+    item.type = 'button';
+    item.className = `menu-item-base menu-item${options.className ? ` ${options.className}` : ''}`;
+
+    if (options.title) {
+      item.title = options.title;
+      item.setAttribute('aria-label', options.title);
+    }
+
+    item.appendChild(this.createMenuItemLabel(doc, options.label, options.icon));
+
+    if (options.shortcutIcon || options.shortcutText) {
+      const shortcut = doc.createElement('span');
+      shortcut.className = 'menu-item__shortcut';
+      if (options.shortcutIcon) {
+        shortcut.appendChild(this.createMenuIcon(doc, options.shortcutIcon));
+      } else if (options.shortcutText) {
+        shortcut.textContent = options.shortcutText;
+      }
+      item.appendChild(shortcut);
+    }
+
+    return item;
+  }
+
+  private getXmindMenuIcon(type: 'file' | 'markdown' | 'opml' | 'chevron') {
+    if (type === 'file') {
+      return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path><path d="M14 3v5h5"></path><path d="M12 11v6"></path><path d="m9.5 14.5 2.5 2.5 2.5-2.5"></path></svg>';
+    }
+
+    if (type === 'markdown') {
+      return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6h14a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1z"></path><path d="M7 15V9l3 3 3-3v6"></path><path d="M16 9v6"></path><path d="m14.5 13 1.5 2 1.5-2"></path></svg>';
+    }
+
+    if (type === 'opml') {
+      return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="1.25"></circle><circle cx="7" cy="12" r="1.25"></circle><circle cx="7" cy="17" r="1.25"></circle><path d="M10 7h7"></path><path d="M10 12h7"></path><path d="M10 17h7"></path></svg>';
+    }
+
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"></path></svg>';
+  }
+
+  private isNodeInside(target: EventTarget | null, element: HTMLElement) {
+    return target instanceof Node && element.contains(target);
+  }
+
+  private showXmindExportMenu(
+    button: HTMLElement,
+    iframe: HTMLIFrameElement,
+    imageInfo: DrawnixImageInfo,
+  ) {
+    const doc = iframe.contentDocument;
+    if (!doc) return;
+
+    const existingMenu = doc.querySelector('.customXmindExportMenu') as (HTMLElement & {
+      __cleanup?: () => void;
+      __anchor?: HTMLElement;
+    }) | null;
+    if (existingMenu?.__anchor === button) {
+      return;
+    }
+
+    this.closeXmindExportMenu(doc);
+
+    const menuHost = doc.querySelector('.drawnix') || doc.body;
+    let closeTimer = 0;
+
+    const menu = doc.createElement('div');
+    menu.className = 'customXmindExportMenu menu';
+    menu.style.position = 'fixed';
+    menu.style.zIndex = '9999';
+    menu.style.minWidth = '188px';
+    menu.style.visibility = 'hidden';
+    menu.style.pointerEvents = 'auto';
+    button.classList.add('menu-item--active');
+
+    const clearCloseTimer = () => {
+      window.clearTimeout(closeTimer);
+      closeTimer = 0;
+    };
+
+    const scheduleClose = () => {
+      clearCloseTimer();
+      closeTimer = window.setTimeout(() => {
+        closeMenu();
+      }, 120);
+    };
+
+    const closeMenu = () => {
+      clearCloseTimer();
+      menu.remove();
+      button.classList.remove('menu-item--active');
+      button.removeEventListener('pointerenter', onButtonEnter);
+      button.removeEventListener('pointerleave', onButtonLeave);
+      doc.removeEventListener('pointerdown', onDocumentPointerDown, true);
+      doc.removeEventListener('keydown', onKeyDown);
+      delete (menu as HTMLElement & { __cleanup?: () => void }).__cleanup;
+      delete (menu as HTMLElement & { __anchor?: HTMLElement }).__anchor;
+    };
+    (menu as HTMLElement & { __cleanup?: () => void }).__cleanup = closeMenu;
+    (menu as HTMLElement & { __anchor?: HTMLElement }).__anchor = button;
+
+    const onDocumentPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (!menu.contains(target) && !button.contains(target)) {
+        closeMenu();
+      }
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeMenu();
+      }
+    };
+
+    const onButtonEnter = () => {
+      clearCloseTimer();
+    };
+
+    const onButtonLeave = (event: PointerEvent) => {
+      if (this.isNodeInside(event.relatedTarget, menu)) {
+        return;
+      }
+      scheduleClose();
+    };
+
+    const onMenuEnter = () => {
+      clearCloseTimer();
+    };
+
+    const onMenuLeave = (event: PointerEvent) => {
+      if (this.isNodeInside(event.relatedTarget, button)) {
+        return;
+      }
+      scheduleClose();
+    };
+
+    const container = doc.createElement('div');
+    container.className = 'menu-container island';
+    menu.addEventListener('pointerenter', onMenuEnter);
+    menu.addEventListener('pointerleave', onMenuLeave);
+    menu.appendChild(container);
+
+    const addMenuItem = (format: XmindImportFormat, label: string) => {
+      const item = this.createMenuItem(doc, {
+        label,
+        title: label,
+      });
+      item.addEventListener('click', (event) => {
+        event.stopPropagation();
+        closeMenu();
+        this.exportXmindImportFile(iframe, imageInfo, format);
+      });
+      container.appendChild(item);
+    };
+
+    addMenuItem('opml', 'OPML');
+    addMenuItem('markdown', 'Markdown');
+
+    menuHost.appendChild(menu);
+    this.positionXmindExportMenu(menu, button, doc);
+    menu.style.visibility = 'visible';
+
+    button.addEventListener('pointerenter', onButtonEnter);
+    button.addEventListener('pointerleave', onButtonLeave);
+
+    setTimeout(() => {
+      doc.addEventListener('pointerdown', onDocumentPointerDown, true);
+      doc.addEventListener('keydown', onKeyDown);
+    });
+  }
+
+  private isDrawnixExportImageMenuItem(menuItem: HTMLElement) {
+    const textContent = menuItem.textContent?.replace(/\s+/g, ' ').trim().toLowerCase() || '';
+    const shortcut = menuItem.querySelector('.menu-item__shortcut')?.textContent?.replace(/\s+/g, '').toLowerCase() || '';
+
+    if (shortcut.includes('shift+e') || shortcut.includes('⇧e')) {
+      return true;
+    }
+
+    return [
+      'export image',
+      '导出图片',
+      '导出图像',
+      '匯出圖片',
+      '匯出圖像',
+    ].some((keyword) => textContent.includes(keyword));
+  }
+
+  private findDrawnixAppMenuContainer(doc: Document) {
+    const containers = Array.from(doc.querySelectorAll('.drawnix .menu .menu-container')) as HTMLElement[];
+    return containers.find((container) => {
+      const menuItems = Array.from(container.querySelectorAll('.menu-item')) as HTMLElement[];
+      return menuItems.some((menuItem) => this.isDrawnixExportImageMenuItem(menuItem));
+    }) || null;
+  }
+
+  private injectXmindExportMenuItem(
+    iframe: HTMLIFrameElement,
+    imageInfo: DrawnixImageInfo,
+  ) {
+    const doc = iframe.contentDocument;
+    if (!doc) return;
+
+    const menuContainer = this.findDrawnixAppMenuContainer(doc);
+    if (!menuContainer || menuContainer.querySelector('.customXmindExportMenuItem')) return;
+
+    const menuItems = Array.from(menuContainer.querySelectorAll('.menu-item')) as HTMLElement[];
+    const exportImageMenuItem = menuItems.find((menuItem) => this.isDrawnixExportImageMenuItem(menuItem));
+    if (!exportImageMenuItem) return;
+
+    const label = this.getI18nText('exportFile', '导出文件');
+    const button = this.createMenuItem(doc, {
+      label,
+      icon: this.getXmindMenuIcon('file'),
+      shortcutIcon: this.getXmindMenuIcon('chevron'),
+      className: 'customXmindExportMenuItem',
+      title: label,
+    });
+    button.setAttribute('aria-haspopup', 'menu');
+    button.addEventListener('pointerenter', () => {
+      this.showXmindExportMenu(button, iframe, imageInfo);
+    });
+    button.addEventListener('focus', () => {
+      this.showXmindExportMenu(button, iframe, imageInfo);
+    });
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.showXmindExportMenu(button, iframe, imageInfo);
+    });
+
+    exportImageMenuItem.insertAdjacentElement('afterend', button);
+  }
+
+  private setupXmindExportMenuInjection(
+    iframe: HTMLIFrameElement,
+    imageInfo: DrawnixImageInfo,
+  ) {
+    const doc = iframe.contentDocument;
+    if (!doc?.body) return () => {};
+
+    let syncTimer = 0;
+    const syncMenuItem = () => {
+      window.clearTimeout(syncTimer);
+      syncTimer = window.setTimeout(() => {
+        this.injectXmindExportMenuItem(iframe, imageInfo);
+      }, 16);
+    };
+
+    const mutationObserver = new MutationObserver(() => {
+      syncMenuItem();
+    });
+
+    mutationObserver.observe(doc.body, {
+      childList: true,
+      subtree: true,
+    });
+    syncMenuItem();
+
+    return () => {
+      mutationObserver.disconnect();
+      window.clearTimeout(syncTimer);
+      this.closeXmindExportMenu(doc);
+      doc.querySelectorAll('.customXmindExportMenuItem').forEach((menuItem) => menuItem.remove());
+    };
+  }
+
   public setupEditTab() {
     const that = this;
     this.addTab({
@@ -647,6 +1206,7 @@ export default class DrawnixPlugin extends Plugin {
           if (!iframe.contentWindow) return;
           iframe.contentWindow.postMessage(message, '*');
         };
+        let cleanupXmindExportMenuInjection = () => {};
 
         const fullscreenOnLogo = '<svg t="1763089104127" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" p-id="5274" width="24" height="24"><path d="M149.333333 394.666667c17.066667 0 32-14.933333 32-32v-136.533334l187.733334 187.733334c6.4 6.4 14.933333 8.533333 23.466666 8.533333s17.066667-2.133333 23.466667-8.533333c12.8-12.8 12.8-32 0-44.8l-187.733333-187.733334H362.666667c17.066667 0 32-14.933333 32-32s-14.933333-32-32-32H149.333333c-4.266667 0-8.533333 0-10.666666 2.133334-8.533333 4.266667-14.933333 10.666667-19.2 17.066666-2.133333 4.266667-2.133333 8.533333-2.133334 12.8v213.333334c0 17.066667 14.933333 32 32 32zM874.666667 629.333333c-17.066667 0-32 14.933333-32 32v136.533334L642.133333 597.333333c-12.8-12.8-32-12.8-44.8 0s-12.8 32 0 44.8l200.533334 200.533334H661.333333c-17.066667 0-32 14.933333-32 32s14.933333 32 32 32h213.333334c4.266667 0 8.533333 0 10.666666-2.133334 8.533333-4.266667 14.933333-8.533333 17.066667-17.066666 2.133333-4.266667 2.133333-8.533333 2.133333-10.666667V661.333333c2.133333-17.066667-12.8-32-29.866666-32zM381.866667 595.2l-200.533334 200.533333V661.333333c0-17.066667-14.933333-32-32-32s-32 14.933333-32 32v213.333334c0 4.266667 0 8.533333 2.133334 10.666666 4.266667 8.533333 8.533333 14.933333 17.066666 17.066667 4.266667 2.133333 8.533333 2.133333 10.666667 2.133333h213.333333c17.066667 0 32-14.933333 32-32s-14.933333-32-32-32h-136.533333l200.533333-200.533333c12.8-12.8 12.8-32 0-44.8s-29.866667-10.666667-42.666666 0zM904.533333 138.666667c0-2.133333 0-2.133333 0 0-4.266667-8.533333-10.666667-14.933333-17.066666-17.066667-4.266667-2.133333-8.533333-2.133333-10.666667-2.133333H661.333333c-17.066667 0-32 14.933333-32 32s14.933333 32 32 32h136.533334l-187.733334 187.733333c-12.8 12.8-12.8 32 0 44.8 6.4 6.4 14.933333 8.533333 23.466667 8.533333s17.066667-2.133333 23.466667-8.533333l187.733333-187.733333V362.666667c0 17.066667 14.933333 32 32 32s32-14.933333 32-32V149.333333c-2.133333-4.266667-2.133333-8.533333-4.266667-10.666666z" fill="#666666" p-id="5275"></path></svg>';
         const fullscreenOffLogo = '<svg t="1763089178999" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" p-id="5443" width="24" height="24"><path d="M313.6 358.4H177.066667c-17.066667 0-32 14.933333-32 32s14.933333 32 32 32h213.333333c4.266667 0 8.533333 0 10.666667-2.133333 8.533333-4.266667 14.933333-8.533333 17.066666-17.066667 2.133333-4.266667 2.133333-8.533333 2.133334-10.666667v-213.333333c0-17.066667-14.933333-32-32-32s-32 14.933333-32 32v136.533333L172.8 125.866667c-12.8-12.8-32-12.8-44.8 0-12.8 12.8-12.8 32 0 44.8l185.6 187.733333zM695.466667 650.666667H832c17.066667 0 32-14.933333 32-32s-14.933333-32-32-32H618.666667c-4.266667 0-8.533333 0-10.666667 2.133333-8.533333 4.266667-14.933333 8.533333-17.066667 17.066667-2.133333 4.266667-2.133333 8.533333-2.133333 10.666666v213.333334c0 17.066667 14.933333 32 32 32s32-14.933333 32-32v-136.533334l200.533333 200.533334c6.4 6.4 14.933333 8.533333 23.466667 8.533333s17.066667-2.133333 23.466667-8.533333c12.8-12.8 12.8-32 0-44.8l-204.8-198.4zM435.2 605.866667c-4.266667-8.533333-8.533333-14.933333-17.066667-17.066667-4.266667-2.133333-8.533333-2.133333-10.666666-2.133333H192c-17.066667 0-32 14.933333-32 32s14.933333 32 32 32h136.533333L128 851.2c-12.8 12.8-12.8 32 0 44.8 6.4 6.4 14.933333 8.533333 23.466667 8.533333s17.066667-2.133333 23.466666-8.533333l200.533334-200.533333V832c0 17.066667 14.933333 32 32 32s32-14.933333 32-32V618.666667c-2.133333-4.266667-2.133333-8.533333-4.266667-12.8zM603.733333 403.2c4.266667 8.533333 8.533333 14.933333 17.066667 17.066667 4.266667 2.133333 8.533333 2.133333 10.666667 2.133333h213.333333c17.066667 0 32-14.933333 32-32s-14.933333-32-32-32h-136.533333L896 170.666667c12.8-12.8 12.8-32 0-44.8-12.8-12.8-32-12.8-44.8 0l-187.733333 187.733333V177.066667c0-17.066667-14.933333-32-32-32s-32 14.933333-32 32v213.333333c2.133333 4.266667 2.133333 8.533333 4.266666 12.8z" fill="#666666" p-id="5444"></path></svg>';
@@ -672,6 +1232,9 @@ export default class DrawnixPlugin extends Plugin {
         document.addEventListener('fullscreenchange', fullscreenChangeHandler);
 
         const onInit = () => {
+          cleanupXmindExportMenuInjection();
+          cleanupXmindExportMenuInjection = that.setupXmindExportMenuInjection(iframe, imageInfo);
+
           let data = { children: [] };
           try {
             if (imageInfo.drawnixData) {
@@ -754,11 +1317,8 @@ export default class DrawnixPlugin extends Plugin {
               fetch(imageInfo.imageURL, { cache: 'reload' }).then(() => {
                 document.querySelectorAll(`img[data-src='${imageInfo.imageURL}']`).forEach(imageElement => {
                   (imageElement as HTMLImageElement).src = imageInfo.imageURL;
-                  const blockElement = imageElement.closest("div[data-type='NodeParagraph']") as HTMLElement;
-                  if (blockElement) {
-                    that.updateAttrLabel(imageInfo, blockElement);
-                  }
                 });
+                that.scheduleFullDrawnixLabelRefresh(0);
               });
             });
           }
@@ -805,6 +1365,7 @@ export default class DrawnixPlugin extends Plugin {
           window.removeEventListener("message", messageEventHandler);
           iframe.contentWindow.removeEventListener("keydown", keydownEventHandleer);
           document.removeEventListener('fullscreenchange', fullscreenChangeHandler);
+          cleanupXmindExportMenuInjection();
         };
       }
     });
@@ -889,8 +1450,12 @@ export default class DrawnixPlugin extends Plugin {
       if (!iframe.contentWindow) return;
       iframe.contentWindow.postMessage(message, '*');
     };
+    let cleanupXmindExportMenuInjection = () => {};
 
     const onInit = () => {
+      cleanupXmindExportMenuInjection();
+      cleanupXmindExportMenuInjection = this.setupXmindExportMenuInjection(iframe, imageInfo);
+
       let data = { children: [] };
       try {
         if (imageInfo.drawnixData) {
@@ -1020,11 +1585,8 @@ export default class DrawnixPlugin extends Plugin {
           fetch(imageInfo.imageURL, { cache: 'reload' }).then(() => {
             document.querySelectorAll(`img[data-src='${imageInfo.imageURL}']`).forEach(imageElement => {
               (imageElement as HTMLImageElement).src = imageInfo.imageURL;
-              const blockElement = imageElement.closest("div[data-type='NodeParagraph']") as HTMLElement;
-              if (blockElement) {
-                this.updateAttrLabel(imageInfo, blockElement);
-              }
             });
+            this.scheduleFullDrawnixLabelRefresh(0);
             // (已改为立即打开标签页 — 不在这里处理)
           });
         });
@@ -1069,6 +1631,7 @@ export default class DrawnixPlugin extends Plugin {
     window.addEventListener("message", messageEventHandler);
     dialogDestroyCallbacks.push(() => {
       window.removeEventListener("message", messageEventHandler);
+      cleanupXmindExportMenuInjection();
     });
   }
 
@@ -1112,7 +1675,14 @@ export default class DrawnixPlugin extends Plugin {
         const svgElement = HTMLToElement(svgContent);
         if (svgElement) {
           const defaultSvgElement = HTMLToElement(base64ToUnicode(this.getPlaceholderImageContent('svg').split(',').pop()));
-          defaultSvgElement.setAttribute('content', svgElement.getAttribute('content'));
+          const contentValue = svgElement.getAttribute('content');
+          if (contentValue) {
+            defaultSvgElement.setAttribute('content', contentValue);
+          }
+          const drawnixMetadata = svgElement.getAttribute('data-drawnix');
+          if (drawnixMetadata) {
+            defaultSvgElement.setAttribute('data-drawnix', drawnixMetadata);
+          }
           svgContent = defaultSvgElement.outerHTML;
           base64String = unicodeToBase64(svgContent);
           imageDataURL = `data:image/svg+xml;base64,${base64String}`;

@@ -21,6 +21,7 @@
     <script type="module">
         let isInitialized = false;
         let pendingInitData = null;
+        let latestData = null;
 
         window.addEventListener('message', (event) => {
             const message = event.data;
@@ -44,6 +45,13 @@
                             }, '*');
                         });
                     }
+                    break;
+                case 'export-source':
+                    window.parent.postMessage({
+                        type: 'export-source',
+                        requestId: message.requestId,
+                        data: latestData
+                    }, '*');
                     break;
             }
         });
@@ -71,13 +79,16 @@
 
         function initialize(data) {
              isInitialized = true;
+             latestData = data;
              window.initDrawnix(document.getElementById('root'), data, 
              (newValue) => {
                  // onChange: triggered on every change
+                 latestData = newValue;
                  autoSave(newValue);
              },
              (newValue) => {
                  // onSave: triggered by explicit save action (Ctrl+S or Menu)
+                latestData = newValue;
                 window.parent.postMessage({
                     type: 'save',
                     data: newValue

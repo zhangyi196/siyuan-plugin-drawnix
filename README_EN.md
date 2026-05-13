@@ -1,39 +1,39 @@
-## 📖 Usage
+# siyuan-plugin-drawnix
 
-Type `/drawnix` or `/whiteboard` or `/mindmap`, it will automatically create an image and open Drawnix for creation. After editing, it will be automatically saved as an image format (SVG/PNG), supporting secondary editing.
+Drawnix whiteboard plugin for SiYuan Notes. It supports whiteboards, mind maps, flowcharts, and saves content as `SVG` / `PNG` images.
 
-<img alt="image" src="https://fastly.jsdelivr.net/gh/Achuan-2/PicBed@pic/assets/image-20251204211359-0dgyxrh.png" />
+## Features
 
-<img alt="image" src="https://fastly.jsdelivr.net/gh/Achuan-2/PicBed@pic/assets/image-20251204211409-2d50k32.png" />
+- Create a Drawnix canvas from `/drawnix`, `/whiteboard`, or `/mindmap`.
+- Reopen saved images for further editing.
+- Restore editing data from embedded image metadata after copying the image block to another location.
+- Open the editor in a dialog or a tab.
+- Export the current board as XMind-importable `OPML` or `Markdown`.
+- Show the main mind-map branch name at the top-left of the outer block UI.
 
-> ⚠️ Note: Currently, the secondary editing of images is implemented by writing drawnix data through custom block attributes. If the custom block attributes are deleted or modified, data may be lost and secondary editing will not be possible.
+## Usage
 
-## ⚙️ Plugin Settings Overview
+Use `/drawnix`, `/whiteboard`, or `/mindmap` from the slash menu to create a canvas. Press `Ctrl+S` to save. The plugin stores board data in both the block attribute and the image metadata so later edits and copied blocks can still be restored.
 
-<img alt="image" src="https://fastly.jsdelivr.net/gh/Achuan-2/PicBed@pic/assets/image-20251204212438-8ywm730.png" />
+The XMind export entry is in the editor toolbar. Choose `OPML` or `Markdown`, then import the downloaded file in XMind through `File > Import`.
 
-## 📦 Development
+> Note: secondary editing is no longer possible if both the embedded image metadata and the `custom-drawnix` block attribute are removed.
 
-How to build the plugin:
+## Local Testing
+
+1. Run `pnpm install`.
+2. Run `pnpm run prepare:drawnix` if you need to refresh embedded Drawnix assets.
+3. Set `VITE_SIYUAN_WORKSPACE_PATH=<your SiYuan workspace path>` in `.env`.
+4. Run `pnpm run dev`.
+5. Reload the plugin in SiYuan and test.
+
+## Build
 
 ```bash
-pnpm run prepare:drawnix
 pnpm build
 ```
 
-## ❤️ Acknowledgments
+## Credits
 
-- [drawnix](https://github.com/plait-board/drawnix)
-- Inspired by the embedded plugin design from [YuxinZhaozyx](https://github.com/YuxinZhaozyx/siyuan-embed-excalidraw)
-
-## ❤️ Support
-
-If you like my plugin, please star the GitHub repository and consider supporting me via WeChat donation. This will motivate me to continue improving this plugin and developing new ones.
-
-Maintaining plugins is time-consuming and labor-intensive. Personal time and energy are limited. Open source is just for sharing, not an obligation to spend my time implementing features that users need for free.
-
-I will gradually improve features that I need (donations can speed up development). Some features that I think can be improved but are not necessary at this stage require donations to be implemented (will be marked with donation tags and required donation amount). Features that are not needed or too complicated to implement will be directly closed without consideration. PRs are welcome for features I haven't implemented.
-
-Friends who have donated a total of 50 yuan and want to add me on WeChat can leave your WeChat ID in the donation note, or send an email to achuan-2@outlook.com for a friend request.
-
-<img alt="image" src="https://fastly.jsdelivr.net/gh/Achuan-2/PicBed@pic/assets/network-asset-network-asset-image-20250614123558-fuhir5v.png" />
+- [Drawnix](https://github.com/plait-board/drawnix)
+- [siyuan-embed-excalidraw](https://github.com/YuxinZhaozyx/siyuan-embed-excalidraw)

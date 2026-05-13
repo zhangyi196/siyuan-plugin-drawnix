@@ -1,39 +1,43 @@
-## 📖 使用
+# siyuan-plugin-drawnix
 
-斜杆菜单输入 `/drawnix`​或`/白板`​或`/思维导图`，选择 Drawnix，会自动创建图片并打开 Drawnix 进行创作，编辑完成后，按Ctrl+S会自动保存为图片格式（SVG/PNG），支持二次编辑。
+思源笔记中的 Drawnix 白板插件，支持白板、思维导图、流程图等绘制，并保存为 `SVG` / `PNG` 图片。
 
-<img alt="image" src="https://fastly.jsdelivr.net/gh/Achuan-2/PicBed@pic/assets/image-20251204211359-0dgyxrh.png" />
+## 功能
 
-<img alt="image" src="https://fastly.jsdelivr.net/gh/Achuan-2/PicBed@pic/assets/image-20251204211409-2d50k32.png" />
+- 通过 `/drawnix`、`/白板`、`/思维导图` 快速创建 Drawnix 画布。
+- 保存为图片后仍可二次编辑。
+- 图片复制到其他位置后，会优先从图片内嵌 metadata 恢复编辑数据，继续编辑。
+- 编辑器支持在对话框或标签页中打开。
+- 支持导出为 XMind 可导入的 `OPML` / `Markdown` 文件。
+- 思维导图块左上角会显示主分支名称，便于在文档中识别。
 
-> ⚠️ 使用注意：目前图片支持二次编辑是通过自定义块属性写入drawnix数据实现的，如果自定义块属性被删除或者修改，可能会导致数据丢失，无法二次编辑。
+## 使用
 
-## ⚙️ 插件设置概览
+斜杆菜单输入 `/drawnix`、`/白板` 或 `/思维导图`，选择 Drawnix 后会自动创建图片并打开编辑器。编辑完成后按 `Ctrl+S` 保存，插件会把画布数据写入块属性和图片 metadata，用于后续二次编辑与复制恢复。
 
-<img alt="image" src="https://fastly.jsdelivr.net/gh/Achuan-2/PicBed@pic/assets/image-20251204212438-8ywm730.png" />
+XMind 导出入口位于编辑器工具栏，选择 `OPML` 或 `Markdown` 后，可在 XMind 中通过 `File > Import` 导入。
 
-## 📦 开发
+> 注意：如果图片 metadata 和块属性 `custom-drawnix` 都被移除，则无法继续二次编辑。
 
-如何打包插件：
+<img alt="drawnix editor" src="https://fastly.jsdelivr.net/gh/Achuan-2/PicBed@pic/assets/image-20251204211359-0dgyxrh.png" />
+
+<img alt="drawnix settings" src="https://fastly.jsdelivr.net/gh/Achuan-2/PicBed@pic/assets/image-20251204212438-8ywm730.png" />
+
+## 本地测试
+
+1. 运行 `pnpm install`。
+2. 如需同步 Drawnix 嵌入资源，运行 `pnpm run prepare:drawnix`。
+3. 在 `.env` 中设置 `VITE_SIYUAN_WORKSPACE_PATH=<你的思源工作空间路径>`。
+4. 运行 `pnpm run dev`，产物会写入思源工作空间的 `data/plugins/siyuan-plugin-drawnix`。
+5. 回到思源插件管理，重载插件后测试。
+
+## 构建
 
 ```bash
-pnpm run prepare:drawnix
 pnpm build
 ```
 
-## ❤️致谢
+## 致谢
 
-- 画布基于[Drawnix](https://github.com/plait-board/drawnix)开源项目进行二次开发
-- 参考了[YuxinZhaozyx](https://github.com/YuxinZhaozyx/siyuan-embed-excalidraw)嵌入式系列插件的设计
-
-## ❤️用爱发电
-
-如果喜欢我的插件，欢迎给GitHub仓库点star和微信赞赏，这会激励我继续完善此插件和开发新插件。
-
-维护插件费时费力，个人时间和精力有限，开源只是分享，不等于我要浪费我的时间免费帮用户实现ta需要的功能，
-
-我需要的功能我会慢慢改进（打赏可以催更），有些我觉得可以改进、但是现阶段不必要的功能需要打赏才改进（会标注打赏标签和需要打赏金额），而不需要的功能、实现很麻烦的功能会直接关闭issue不考虑实现，我没实现的功能欢迎有大佬来pr
-
-累积赞赏50元的朋友如果想加我微信，可以在赞赏的时候备注微信号，或者发邮件到achuan-2@outlook.com来进行好友申请
-
-<img alt="image" src="https://fastly.jsdelivr.net/gh/Achuan-2/PicBed@pic/assets/network-asset-network-asset-image-20250614123558-fuhir5v.png" />
+- [Drawnix](https://github.com/plait-board/drawnix)
+- [siyuan-embed-excalidraw](https://github.com/YuxinZhaozyx/siyuan-embed-excalidraw)

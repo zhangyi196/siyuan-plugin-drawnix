@@ -13,5 +13,12 @@
   "editWindow": "编辑窗口",
   "editWindowDescription": "编辑窗口的形式",
   "themeMode": "主题模式",
-  "themeModeDescription": "窗口的主题"
+  "themeModeDescription": "窗口的主题",
+  "exportXmind": "导出为 XMind",
+  "exportFile": "导出文件",
+  "exportOPML": "导出 OPML",
+  "exportMarkdown": "导出 Markdown",
+  "noTextToExport": "没有可导出的文本",
+  "exportFailed": "导出失败",
+  "exportSuccess": "导出成功"
 }
