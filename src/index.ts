@@ -142,9 +142,6 @@ export default class DrawnixPlugin extends Plugin {
     this._globalKeyDownHandler = this.globalKeyDownHandler.bind(this);
     document.documentElement.addEventListener("keydown", this._globalKeyDownHandler);
 
-    this._mouseOverHandler = this.mouseOverHandler.bind(this);
-    document.addEventListener("mouseover", this._mouseOverHandler);
-
     this._drawnixPreviewDragStartHandler = this.drawnixPreviewDragStartHandler.bind(this);
     document.addEventListener("dragstart", this._drawnixPreviewDragStartHandler, true);
 
@@ -161,7 +158,6 @@ export default class DrawnixPlugin extends Plugin {
     if (this._mutationObserver) this._mutationObserver.disconnect();
     if (this._openMenuImageHandler) this.eventBus.off("open-menu-image", this._openMenuImageHandler);
     if (this._globalKeyDownHandler) document.documentElement.removeEventListener("keydown", this._globalKeyDownHandler);
-    if (this._mouseOverHandler) document.removeEventListener("mouseover", this._mouseOverHandler);
     if (this._drawnixPreviewDragStartHandler) document.removeEventListener("dragstart", this._drawnixPreviewDragStartHandler, true);
     if (this._drawnixPreviewPointerDownHandler) document.removeEventListener("pointerdown", this._drawnixPreviewPointerDownHandler, true);
     if (this._drawnixPreviewMouseDownHandler) document.removeEventListener("mousedown", this._drawnixPreviewMouseDownHandler, true);
@@ -327,6 +323,14 @@ export default class DrawnixPlugin extends Plugin {
           || !!elementNode.querySelector("div[data-type='NodeParagraph'], .img[data-type='img'], img");
       };
 
+      const getRelevantChangedNodes = (mutation: MutationRecord) => {
+        return [...mutation.addedNodes, ...mutation.removedNodes].filter((node) => {
+          return node instanceof Element
+            && !this.isIgnoredDrawnixPreviewMutationNode(node)
+            && isRelevantElement(node);
+        });
+      };
+
       const hasRelevantMutation = mutations.some((mutation) => {
         if (mutation.type === 'attributes') {
           if (!(mutation.target instanceof Element)) {
@@ -337,16 +341,27 @@ export default class DrawnixPlugin extends Plugin {
             return mutation.target.matches("div[data-type='NodeParagraph']");
           }
 
-          return mutation.target.matches(".img[data-type='img'], img");
+          if (mutation.attributeName === 'style') {
+            return mutation.target.matches(".img[data-type='img'], img")
+              && this.hasMeaningfulPreviewSizeMutation(mutation.target);
+          }
+
+          if (mutation.attributeName === 'width' || mutation.attributeName === 'height') {
+            return mutation.target.matches(".img[data-type='img'], img");
+          }
+
+          return mutation.attributeName === 'data-src' || mutation.attributeName === 'src';
         }
 
         if (!(mutation.target instanceof Element) || !mutation.target.closest("div[data-type='NodeParagraph']")) {
-          return [...mutation.addedNodes, ...mutation.removedNodes].some((node) => {
-            return node instanceof Element && isRelevantElement(node);
-          });
+          return getRelevantChangedNodes(mutation).length > 0;
         }
 
-        return true;
+        if (this.isIgnoredDrawnixPreviewMutationNode(mutation.target)) {
+          return false;
+        }
+
+        return getRelevantChangedNodes(mutation).length > 0;
       });
 
       if (hasRelevantMutation) {
@@ -597,6 +612,42 @@ export default class DrawnixPlugin extends Plugin {
     }
   }
 
+  private setStylePropertyIfChanged(element: HTMLElement, propertyName: string, propertyValue: string) {
+    if (element.style.getPropertyValue(propertyName) === propertyValue) {
+      return;
+    }
+    element.style.setProperty(propertyName, propertyValue);
+  }
+
+  private hasMeaningfulPreviewSizeMutation(target: Element) {
+    const element = target as HTMLElement;
+    if (!element) return false;
+
+    const style = element.style;
+    return !!(
+      style.width
+      || style.height
+      || style.minWidth
+      || style.maxWidth
+      || style.minHeight
+      || style.maxHeight
+      || element.getAttribute("width")
+      || element.getAttribute("height")
+    );
+  }
+
+  private isIgnoredDrawnixPreviewMutationNode(node: Node) {
+    if (!(node instanceof Element)) {
+      return false;
+    }
+
+    return !!(
+      node.closest(".drawnix-preview-toolbar")
+      || node.closest(`[${DRAWNIX_NATIVE_RESIZE_ATTR}]`)
+      || node.closest(`[${DRAWNIX_NATIVE_ACTION_ATTR}]`)
+    );
+  }
+
   private getDrawnixToolbarMoreIconHTML(imgContainer: HTMLDivElement | null): string {
     const nativeMenuTrigger = this.getDrawnixNativeMenuTrigger(imgContainer);
     if (nativeMenuTrigger?.innerHTML?.trim()) {
@@ -695,8 +746,8 @@ export default class DrawnixPlugin extends Plugin {
     const labelText = imgContainer.getAttribute("data-drawnix-label") || "";
     const labelWidth = Math.min(this.measureDrawnixLabelWidth(imgContainer, labelText), maxLabelWidth);
 
-    imgContainer.style.setProperty("--drawnix-toolbar-width", `${toolbarWidth}px`);
-    imgContainer.style.setProperty("--drawnix-label-width", `${labelWidth}px`);
+    this.setStylePropertyIfChanged(imgContainer, "--drawnix-toolbar-width", `${toolbarWidth}px`);
+    this.setStylePropertyIfChanged(imgContainer, "--drawnix-label-width", `${labelWidth}px`);
   }
 
   private ensureDrawnixPreviewToolbar(blockElement: HTMLElement, imgContainer: HTMLDivElement, imageURL: string) {
