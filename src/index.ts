@@ -55,6 +55,8 @@ const DRAWNIX_NATIVE_RESIZE_ATTR = "data-drawnix-native-resize";
 const DRAWNIX_NATIVE_ACTION_ATTR = "data-drawnix-native-action";
 const DRAWNIX_PREVIEW_INSET = 8;
 const DRAWNIX_PREVIEW_TOOLBAR_GAP = 8;
+const DUPLICATE_DRAWNIX_REPAIR_NOTIFY_DELAY = 480;
+const DUPLICATE_DRAWNIX_REPAIR_NOTIFY_THRESHOLD = 3;
 
 // Type definitions
 interface DrawnixImageInfo {
@@ -119,7 +121,9 @@ export default class DrawnixPlugin extends Plugin {
   private isRefreshingDrawnixLabels = false;
   private pendingDrawnixLabelRefresh = false;
   private materializingDrawnixBlockIDs = new Set<string>();
-  private duplicateDrawnixRepairFailures = new Set<string>();
+  private duplicateDrawnixRepairFailures = new Map<string, number>();
+  private duplicateDrawnixRepairNotificationTimers = new Map<string, number>();
+  private duplicateDrawnixRepairNotifiedURLs = new Set<string>();
 
   private settingItems: SettingItem[];
   public EDIT_TAB_TYPE = "drawnix-edit-tab";
@@ -481,6 +485,74 @@ export default class DrawnixPlugin extends Plugin {
     return currentCandidate;
   }
 
+  private shouldNotifyDuplicateDrawnixRepairFailure(imageURL: string) {
+    this.registerDuplicateDrawnixRepairFailure(imageURL);
+    return false;
+  }
+
+  private registerDuplicateDrawnixRepairFailure(imageURL: string, delay = DUPLICATE_DRAWNIX_REPAIR_NOTIFY_DELAY) {
+    if (!imageURL || this.duplicateDrawnixRepairNotificationTimers.has(imageURL) || this.duplicateDrawnixRepairNotifiedURLs.has(imageURL)) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      this.duplicateDrawnixRepairNotificationTimers.delete(imageURL);
+      void this.verifyDuplicateDrawnixRepairFailure(imageURL);
+    }, delay);
+    this.duplicateDrawnixRepairNotificationTimers.set(imageURL, timer);
+  }
+
+  private collectVisibleDrawnixContextsByImageURL(imageURL: string) {
+    return this.collectDrawnixLabelBlocks()
+      .map((blockElement) => this.getDrawnixBlockContext(blockElement))
+      .filter((context): context is DrawnixBlockContext => !!context && context.imageURL === imageURL);
+  }
+
+  private async verifyDuplicateDrawnixRepairFailure(imageURL: string) {
+    if (!imageURL) return;
+
+    const contexts = this.collectVisibleDrawnixContextsByImageURL(imageURL);
+    if (contexts.length <= 1) {
+      this.clearDuplicateDrawnixRepairFailure(imageURL);
+      return;
+    }
+
+    if (this.isRefreshingDrawnixLabels || contexts.some((context) => this.materializingDrawnixBlockIDs.has(context.blockID))) {
+      this.registerDuplicateDrawnixRepairFailure(imageURL, 200);
+      return;
+    }
+
+    const nextFailureCount = (this.duplicateDrawnixRepairFailures.get(imageURL) || 0) + 1;
+    this.duplicateDrawnixRepairFailures.set(imageURL, nextFailureCount);
+
+    if (nextFailureCount < DUPLICATE_DRAWNIX_REPAIR_NOTIFY_THRESHOLD) {
+      this.scheduleFullDrawnixLabelRefresh(0);
+      this.registerDuplicateDrawnixRepairFailure(imageURL);
+      return;
+    }
+
+    if (this.duplicateDrawnixRepairNotifiedURLs.has(imageURL)) {
+      return;
+    }
+
+    this.duplicateDrawnixRepairNotifiedURLs.add(imageURL);
+    this.pushNotification(this.getI18nText(
+      'duplicateCopyRepairFailed',
+      '复制的 Drawnix 内容恢复失败，请先重新保存原图后再复制。',
+    ));
+  }
+
+  private clearDuplicateDrawnixRepairFailure(imageURL: string) {
+    this.duplicateDrawnixRepairFailures.delete(imageURL);
+    this.duplicateDrawnixRepairNotifiedURLs.delete(imageURL);
+
+    const timer = this.duplicateDrawnixRepairNotificationTimers.get(imageURL);
+    if (typeof timer === 'number') {
+      window.clearTimeout(timer);
+    }
+    this.duplicateDrawnixRepairNotificationTimers.delete(imageURL);
+  }
+
   public async getDrawnixImageInfo(imageURL: string, blockElement?: HTMLElement): Promise<DrawnixImageInfo | null> {
     const imageURLRegex = /^assets\/.+\.(?:svg|png)$/;
     if (!imageURLRegex.test(imageURL)) return null;
@@ -756,11 +828,14 @@ export default class DrawnixPlugin extends Plugin {
     for (const contexts of groupedContexts.values()) {
       if (contexts.length <= 1) continue;
 
+      const failureKey = contexts[0].imageURL;
       const { imageData, bestGroupData, bestBlockDataMap } = await this.resolveDuplicateDrawnixGroupData(contexts);
       if (!bestGroupData) {
-        const failureKey = contexts[0].imageURL;
-        if (!this.duplicateDrawnixRepairFailures.has(failureKey)) {
-          this.duplicateDrawnixRepairFailures.add(failureKey);
+        console.warn('Skipped duplicated Drawnix repair because no valid group data was found', {
+          imageURL: failureKey,
+          blockIDs: contexts.map((context) => context.blockID),
+        });
+        if (this.shouldNotifyDuplicateDrawnixRepairFailure(failureKey)) {
           this.pushNotification(this.getI18nText(
             'duplicateCopyRepairFailed',
             '复制的 Drawnix 内容恢复失败，请先重新保存原图后再复制。',
@@ -769,7 +844,7 @@ export default class DrawnixPlugin extends Plugin {
         continue;
       }
 
-      this.duplicateDrawnixRepairFailures.delete(contexts[0].imageURL);
+      let groupFailed = false;
 
       for (const context of contexts.slice(1)) {
         const blockData = bestBlockDataMap.get(context.blockID) || bestGroupData;
@@ -777,12 +852,19 @@ export default class DrawnixPlugin extends Plugin {
           await this.materializeDrawnixDuplicateBlock(context, blockData, imageData);
           didDetachDuplicateAsset = true;
         } catch (err) {
+          groupFailed = true;
           console.error('Failed to materialize duplicated Drawnix block', err);
-          this.pushNotification(this.getI18nText(
-            'duplicateCopyRepairFailed',
+          if (this.shouldNotifyDuplicateDrawnixRepairFailure(failureKey)) {
+            this.pushNotification(this.getI18nText(
+              'duplicateCopyRepairFailed',
             '复制的 Drawnix 内容恢复失败，请先重新保存原图后再复制。',
           ));
+          }
         }
+      }
+
+      if (!groupFailed) {
+        this.clearDuplicateDrawnixRepairFailure(failureKey);
       }
     }
 
