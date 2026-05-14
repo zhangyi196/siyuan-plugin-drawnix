@@ -20,5 +20,6 @@
   "exportMarkdown": "导出 Markdown",
   "noTextToExport": "没有可导出的文本",
   "exportFailed": "导出失败",
-  "exportSuccess": "导出成功"
+  "exportSuccess": "导出成功",
+  "duplicateCopyRepairFailed": "复制的 Drawnix 内容恢复失败，请先重新保存原图后再复制。"
 }

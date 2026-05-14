@@ -65,6 +65,23 @@ interface DrawnixImageInfo {
   drawnixData?: string; // JSON string of drawnix board data
 }
 
+interface DrawnixBlockContext {
+  blockID: string;
+  blockElement: HTMLElement;
+  imgContainer: HTMLDivElement;
+  imageURL: string;
+  format: 'svg' | 'png';
+}
+
+interface DrawnixDataCandidate {
+  blockID: string;
+  source: 'dom' | 'api' | 'metadata';
+  data: string;
+  topicCount: number;
+  rawLength: number;
+  sourcePriority: number;
+}
+
 type SyFrontendTypes = 'desktop' | 'desktop-window' | 'mobile' | 'browser' | 'browser-desktop' | 'browser-mobile';
 
 interface SettingItem {
@@ -99,6 +116,10 @@ export default class DrawnixPlugin extends Plugin {
   private _drawnixPreviewMouseDownHandler;
   private isMouseOverProcessing = false;
   private fullLabelRefreshTimer: number | null = null;
+  private isRefreshingDrawnixLabels = false;
+  private pendingDrawnixLabelRefresh = false;
+  private materializingDrawnixBlockIDs = new Set<string>();
+  private duplicateDrawnixRepairFailures = new Set<string>();
 
   private settingItems: SettingItem[];
   public EDIT_TAB_TYPE = "drawnix-edit-tab";
@@ -383,26 +404,91 @@ export default class DrawnixPlugin extends Plugin {
     return /^assets\/drawnix-image-.+\.(?:svg|png)$/i.test(imageURL || '');
   }
 
+  private getDrawnixImageFormatFromURL(imageURL: string): 'svg' | 'png' {
+    return imageURL.endsWith('.svg') ? 'svg' : 'png';
+  }
+
+  private getDrawnixBlockContext(blockElement: HTMLElement | null): DrawnixBlockContext | null {
+    if (!blockElement) return null;
+
+    const blockID = blockElement.getAttribute("data-node-id") || '';
+    const imgContainer = blockElement.querySelector(".img[data-type='img']") as HTMLDivElement | null;
+    const imageElement = imgContainer?.querySelector("img") as HTMLImageElement | null;
+    const imageURL = imageElement?.getAttribute("data-src") || imageElement?.getAttribute("src") || "";
+
+    if (!blockID || !imgContainer || !this.isDrawnixAssetURL(imageURL)) {
+      return null;
+    }
+
+    return {
+      blockID,
+      blockElement,
+      imgContainer,
+      imageURL,
+      format: this.getDrawnixImageFormatFromURL(imageURL),
+    };
+  }
+
+  private parseDrawnixBoardData(drawnixData: string): unknown | null {
+    if (!drawnixData) return null;
+
+    try {
+      return JSON.parse(drawnixData);
+    } catch {
+      return null;
+    }
+  }
+
+  private createDrawnixDataCandidate(
+    blockID: string,
+    source: DrawnixDataCandidate['source'],
+    drawnixData: string,
+  ): DrawnixDataCandidate | null {
+    const boardData = this.parseDrawnixBoardData(drawnixData);
+    if (!boardData) return null;
+
+    const sourcePriorityMap: Record<DrawnixDataCandidate['source'], number> = {
+      dom: 3,
+      api: 2,
+      metadata: 1,
+    };
+
+    return {
+      blockID,
+      source,
+      data: drawnixData,
+      topicCount: extractFlatTopics(boardData).length,
+      rawLength: drawnixData.length,
+      sourcePriority: sourcePriorityMap[source],
+    };
+  }
+
+  private pickPreferredDrawnixDataCandidate(
+    currentCandidate: DrawnixDataCandidate | null,
+    nextCandidate: DrawnixDataCandidate | null,
+  ) {
+    if (!nextCandidate) return currentCandidate;
+    if (!currentCandidate) return nextCandidate;
+    if (nextCandidate.topicCount !== currentCandidate.topicCount) {
+      return nextCandidate.topicCount > currentCandidate.topicCount ? nextCandidate : currentCandidate;
+    }
+    if (nextCandidate.rawLength !== currentCandidate.rawLength) {
+      return nextCandidate.rawLength > currentCandidate.rawLength ? nextCandidate : currentCandidate;
+    }
+    if (nextCandidate.sourcePriority !== currentCandidate.sourcePriority) {
+      return nextCandidate.sourcePriority > currentCandidate.sourcePriority ? nextCandidate : currentCandidate;
+    }
+    return currentCandidate;
+  }
+
   public async getDrawnixImageInfo(imageURL: string, blockElement?: HTMLElement): Promise<DrawnixImageInfo | null> {
     const imageURLRegex = /^assets\/.+\.(?:svg|png)$/;
     if (!imageURLRegex.test(imageURL)) return null;
 
-    let blockID = '';
-    let drawnixData = '';
+    if (!blockElement) return null;
 
-    if (blockElement) {
-      blockID = blockElement.getAttribute("data-node-id");
-      drawnixData = blockElement.getAttribute("custom-drawnix");
-    } else {
-      const imageElement = document.querySelector(`img[data-src="${imageURL}"]`);
-      if (imageElement) {
-        blockElement = imageElement.closest('[data-node-id]') as HTMLElement;
-        if (blockElement) {
-          blockID = blockElement.getAttribute("data-node-id");
-          drawnixData = blockElement.getAttribute("custom-drawnix");
-        }
-      }
-    }
+    const blockID = blockElement.getAttribute("data-node-id") || '';
+    let drawnixData = blockElement.getAttribute("custom-drawnix") || '';
 
     if (!blockID) return null;
 
@@ -421,7 +507,7 @@ export default class DrawnixPlugin extends Plugin {
       drawnixData = extractDrawnixMetadata(imageContent) || '';
       if (drawnixData && blockID) {
         try {
-          await fetchSyncPost('/api/attr/setBlockAttrs', { id: blockID, attrs: { 'custom-drawnix': drawnixData } });
+          await this.setDrawnixBlockData(blockID, drawnixData);
         } catch (err) {
           console.error('Failed to restore drawnix metadata from image', err);
         }
@@ -434,7 +520,7 @@ export default class DrawnixPlugin extends Plugin {
       blockID: blockID,
       imageURL: imageURL,
       data: imageContent,
-      format: imageURL.endsWith(".svg") ? "svg" : "png",
+      format: this.getDrawnixImageFormatFromURL(imageURL),
       drawnixData: drawnixData,
     }
     return imageInfo;
@@ -451,7 +537,7 @@ export default class DrawnixPlugin extends Plugin {
 
   public async newDrawnixImage(protyle: any, blockID: string, callback?: (imageInfo: DrawnixImageInfo) => void) {
     const format = this.data[STORAGE_NAME].embedImageFormat;
-    const imageName = `drawnix-image-${window.Lute.NewNodeID()}.${format}`;
+    const imageName = this.createDrawnixAssetFileName(format);
     const defaultDrawnixData = {
       "type": "drawnix",
       "version": 1,
@@ -471,32 +557,24 @@ export default class DrawnixPlugin extends Plugin {
       this.getPlaceholderImageContent(format),
       JSON.stringify(defaultDrawnixData),
     );
-    const blob = dataURLToBlob(placeholderImageContent);
-    const file = new File([blob], imageName, { type: blob.type });
-    const formData = new FormData();
-    formData.append('path', `data/assets/${imageName}`);
-    formData.append('file', file);
-    formData.append('isDir', 'false');
-    await fetchSyncPost('/api/file/putFile', formData);
-      const imageURL = `assets/${imageName}`;
-      protyle.insert(`![](${imageURL})`);
-      // 将初始的 drawnix 数据写入块属性，参考 mindmap 插件的实现方式
-      if (blockID) {
-        try {
-          await fetchSyncPost('/api/attr/setBlockAttrs', { id: blockID, attrs: { 'custom-drawnix': JSON.stringify(defaultDrawnixData) } });
-        } catch (err) { }
-      }
+    const imageURL = await this.uploadDrawnixAssetFile(imageName, placeholderImageContent);
+    protyle.insert(`![](${imageURL})`);
+    if (blockID) {
+      try {
+        await this.setDrawnixBlockData(blockID, JSON.stringify(defaultDrawnixData));
+      } catch (err) { }
+    }
 
-      const imageInfo: DrawnixImageInfo = {
-        blockID: blockID,
-        imageURL: imageURL,
-        data: placeholderImageContent,
-        format: format,
-        drawnixData: JSON.stringify(defaultDrawnixData),
-      };
-      if (callback) {
-        callback(imageInfo);
-      }
+    const imageInfo: DrawnixImageInfo = {
+      blockID: blockID,
+      imageURL: imageURL,
+      data: placeholderImageContent,
+      format: format,
+      drawnixData: JSON.stringify(defaultDrawnixData),
+    };
+    if (callback) {
+      callback(imageInfo);
+    }
   }
 
   public async getDrawnixImage(imageURL: string, reload: boolean): Promise<string> {
@@ -512,6 +590,203 @@ export default class DrawnixPlugin extends Plugin {
   private async getBlockAttrs(blockId: string): Promise<any> {
     const result = await fetchSyncPost('/api/attr/getBlockAttrs', { id: blockId });
     return result?.data || null;
+  }
+
+  private async setDrawnixBlockData(blockId: string, drawnixData: string) {
+    await fetchSyncPost('/api/attr/setBlockAttrs', { id: blockId, attrs: { 'custom-drawnix': drawnixData } });
+  }
+
+  private createDrawnixAssetFileName(format: DrawnixImageInfo['format']) {
+    return `drawnix-image-${window.Lute.NewNodeID()}.${format}`;
+  }
+
+  private async uploadDrawnixAssetFile(imageName: string, imageData: string) {
+    const blob = dataURLToBlob(imageData);
+    const file = new File([blob], imageName, { type: blob.type });
+    const formData = new FormData();
+    formData.append('path', `data/assets/${imageName}`);
+    formData.append('file', file);
+    formData.append('isDir', 'false');
+    await fetchSyncPost('/api/file/putFile', formData);
+    return `assets/${imageName}`;
+  }
+
+  private async getBlockKramdown(blockId: string): Promise<string | null> {
+    const result = await fetchSyncPost('/api/block/getBlockKramdown', { id: blockId });
+    if (typeof result?.data === 'string') {
+      return result.data;
+    }
+    if (typeof result?.data?.kramdown === 'string') {
+      return result.data.kramdown;
+    }
+    return null;
+  }
+
+  private replaceDrawnixAssetURLInKramdown(kramdown: string, previousImageURL: string, nextImageURL: string) {
+    if (!kramdown || !previousImageURL || !nextImageURL) return kramdown;
+    return kramdown.replace(previousImageURL, nextImageURL);
+  }
+
+  private async persistBlockImageURLReplacement(blockId: string, previousImageURL: string, nextImageURL: string) {
+    const currentKramdown = await this.getBlockKramdown(blockId);
+    if (!currentKramdown) {
+      throw new Error(`Failed to read block kramdown: ${blockId}`);
+    }
+
+    const nextKramdown = this.replaceDrawnixAssetURLInKramdown(currentKramdown, previousImageURL, nextImageURL);
+    if (nextKramdown === currentKramdown) {
+      throw new Error(`Failed to replace Drawnix asset URL for block: ${blockId}`);
+    }
+
+    await fetchSyncPost('/api/block/updateBlock', {
+      id: blockId,
+      dataType: 'markdown',
+      data: nextKramdown,
+    });
+  }
+
+  private async resolveDuplicateDrawnixGroupData(contexts: DrawnixBlockContext[]) {
+    if (!contexts.length) {
+      return {
+        imageData: '',
+        bestGroupData: null as string | null,
+        bestBlockDataMap: new Map<string, string>(),
+      };
+    }
+
+    const imageData = await this.getDrawnixImage(contexts[0].imageURL, true);
+    const metadataData = imageData ? extractDrawnixMetadata(imageData) || '' : '';
+    const blockAttrsList = await Promise.all(contexts.map(async (context) => {
+      try {
+        return await this.getBlockAttrs(context.blockID);
+      } catch (err) {
+        console.error('Failed to read Drawnix block attrs', err);
+        return null;
+      }
+    }));
+
+    let bestGroupCandidate: DrawnixDataCandidate | null = null;
+    const bestBlockDataMap = new Map<string, string>();
+
+    contexts.forEach((context, index) => {
+      let bestBlockCandidate: DrawnixDataCandidate | null = null;
+      const domData = context.blockElement.getAttribute('custom-drawnix') || '';
+      const apiData = blockAttrsList[index]?.['custom-drawnix'] || '';
+
+      bestBlockCandidate = this.pickPreferredDrawnixDataCandidate(
+        bestBlockCandidate,
+        this.createDrawnixDataCandidate(context.blockID, 'dom', domData),
+      );
+      bestBlockCandidate = this.pickPreferredDrawnixDataCandidate(
+        bestBlockCandidate,
+        this.createDrawnixDataCandidate(context.blockID, 'api', apiData),
+      );
+      bestBlockCandidate = this.pickPreferredDrawnixDataCandidate(
+        bestBlockCandidate,
+        this.createDrawnixDataCandidate(context.blockID, 'metadata', metadataData),
+      );
+
+      if (bestBlockCandidate) {
+        bestBlockDataMap.set(context.blockID, bestBlockCandidate.data);
+      }
+
+      bestGroupCandidate = this.pickPreferredDrawnixDataCandidate(bestGroupCandidate, bestBlockCandidate);
+    });
+
+    return {
+      imageData,
+      bestGroupData: bestGroupCandidate?.data || null,
+      bestBlockDataMap,
+    };
+  }
+
+  private async materializeDrawnixDuplicateBlock(
+    context: DrawnixBlockContext,
+    drawnixData: string,
+    sharedImageData: string,
+  ) {
+    if (this.materializingDrawnixBlockIDs.has(context.blockID)) {
+      return;
+    }
+
+    this.materializingDrawnixBlockIDs.add(context.blockID);
+
+    try {
+      const sourceImageData = sharedImageData || await this.getDrawnixImage(context.imageURL, true);
+      if (!sourceImageData) {
+        throw new Error(`Failed to load Drawnix source image: ${context.imageURL}`);
+      }
+
+      const nextImageName = this.createDrawnixAssetFileName(context.format);
+      const nextImageData = embedDrawnixMetadata(sourceImageData, drawnixData);
+      const nextImageURL = await this.uploadDrawnixAssetFile(nextImageName, nextImageData);
+
+      await this.setDrawnixBlockData(context.blockID, drawnixData);
+      await this.persistBlockImageURLReplacement(context.blockID, context.imageURL, nextImageURL);
+
+      if (context.blockElement.isConnected) {
+        context.blockElement.setAttribute('custom-drawnix', drawnixData);
+        const imageElement = context.imgContainer.querySelector('img') as HTMLImageElement | null;
+        if (imageElement) {
+          imageElement.setAttribute('data-src', nextImageURL);
+          imageElement.setAttribute('src', nextImageURL);
+        }
+      }
+    } finally {
+      this.materializingDrawnixBlockIDs.delete(context.blockID);
+    }
+  }
+
+  private async detachDuplicatedDrawnixAssets(blockElements: HTMLElement[]) {
+    const groupedContexts = new Map<string, DrawnixBlockContext[]>();
+
+    blockElements.forEach((blockElement) => {
+      const context = this.getDrawnixBlockContext(blockElement);
+      if (!context || this.materializingDrawnixBlockIDs.has(context.blockID)) {
+        return;
+      }
+
+      const currentGroup = groupedContexts.get(context.imageURL) || [];
+      currentGroup.push(context);
+      groupedContexts.set(context.imageURL, currentGroup);
+    });
+
+    let didDetachDuplicateAsset = false;
+
+    for (const contexts of groupedContexts.values()) {
+      if (contexts.length <= 1) continue;
+
+      const { imageData, bestGroupData, bestBlockDataMap } = await this.resolveDuplicateDrawnixGroupData(contexts);
+      if (!bestGroupData) {
+        const failureKey = contexts[0].imageURL;
+        if (!this.duplicateDrawnixRepairFailures.has(failureKey)) {
+          this.duplicateDrawnixRepairFailures.add(failureKey);
+          this.pushNotification(this.getI18nText(
+            'duplicateCopyRepairFailed',
+            '复制的 Drawnix 内容恢复失败，请先重新保存原图后再复制。',
+          ));
+        }
+        continue;
+      }
+
+      this.duplicateDrawnixRepairFailures.delete(contexts[0].imageURL);
+
+      for (const context of contexts.slice(1)) {
+        const blockData = bestBlockDataMap.get(context.blockID) || bestGroupData;
+        try {
+          await this.materializeDrawnixDuplicateBlock(context, blockData, imageData);
+          didDetachDuplicateAsset = true;
+        } catch (err) {
+          console.error('Failed to materialize duplicated Drawnix block', err);
+          this.pushNotification(this.getI18nText(
+            'duplicateCopyRepairFailed',
+            '复制的 Drawnix 内容恢复失败，请先重新保存原图后再复制。',
+          ));
+        }
+      }
+    }
+
+    return didDetachDuplicateAsset;
   }
 
 
@@ -532,15 +807,14 @@ export default class DrawnixPlugin extends Plugin {
     formData.append("file", file);
     formData.append("isDir", "false");
     const response = await fetchSyncPost("/api/file/putFile", formData);
-      // Save drawnix data to block attributes
-      if (imageInfo.drawnixData) {
-        try {
-          JSON.parse(imageInfo.drawnixData);
-          await fetchSyncPost('/api/attr/setBlockAttrs', { id: imageInfo.blockID, attrs: { 'custom-drawnix': imageInfo.drawnixData } });
-        } catch (e) {
-          console.error("Failed to parse drawnix data", e);
-        }
+    if (imageInfo.drawnixData) {
+      try {
+        JSON.parse(imageInfo.drawnixData);
+        await this.setDrawnixBlockData(imageInfo.blockID, imageInfo.drawnixData);
+      } catch (e) {
+        console.error("Failed to parse drawnix data", e);
       }
+    }
     if (callback) callback(response);
   }
 
@@ -981,9 +1255,32 @@ export default class DrawnixPlugin extends Plugin {
   }
 
   private async refreshAllDrawnixLabels() {
-    this.clearAllDrawnixLabels();
-    const blockElements = this.collectDrawnixLabelBlocks();
-    await Promise.allSettled(blockElements.map((blockElement) => this.syncDrawnixLabel(blockElement)));
+    if (this.isRefreshingDrawnixLabels) {
+      this.pendingDrawnixLabelRefresh = true;
+      return;
+    }
+
+    this.isRefreshingDrawnixLabels = true;
+
+    try {
+      const blockElements = this.collectDrawnixLabelBlocks();
+      const didDetachDuplicateAsset = await this.detachDuplicatedDrawnixAssets(blockElements);
+      if (didDetachDuplicateAsset) {
+        await new Promise<void>((resolve) => {
+          window.requestAnimationFrame(() => resolve());
+        });
+      }
+
+      this.clearAllDrawnixLabels();
+      const refreshedBlockElements = this.collectDrawnixLabelBlocks();
+      await Promise.allSettled(refreshedBlockElements.map((blockElement) => this.syncDrawnixLabel(blockElement)));
+    } finally {
+      this.isRefreshingDrawnixLabels = false;
+      if (this.pendingDrawnixLabelRefresh) {
+        this.pendingDrawnixLabelRefresh = false;
+        this.scheduleFullDrawnixLabelRefresh(0);
+      }
+    }
   }
 
   private async syncDrawnixLabel(blockElement: HTMLElement) {

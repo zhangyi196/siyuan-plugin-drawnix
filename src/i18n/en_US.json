@@ -20,5 +20,6 @@
   "exportMarkdown": "Export Markdown",
   "noTextToExport": "No text to export",
   "exportFailed": "Export failed",
-  "exportSuccess": "Exported"
+  "exportSuccess": "Exported",
+  "duplicateCopyRepairFailed": "Failed to restore copied Drawnix content. Please resave the original diagram before copying it again."
 }
