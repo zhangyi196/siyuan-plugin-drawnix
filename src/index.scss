@@ -133,7 +133,7 @@ div[data-type='NodeParagraph'] .img[data-type='img'][data-drawnix-label]::before
     position: absolute;
     top: 8px;
     left: 8px;
-    max-width: var(--drawnix-label-width, calc(100% - 16px));
+    max-width: var(--drawnix-label-width, calc(100% - 16px - var(--drawnix-toolbar-width, 0px) - var(--drawnix-toolbar-gap, 8px)));
     display: block;
     padding: 2px 8px;
     overflow: hidden;
@@ -154,7 +154,7 @@ div[data-type='NodeParagraph']:not(:hover) .img[data-type='img'][data-drawnix-la
 div[data-type='NodeParagraph'][data-drawnix-preview-block='true'] .img[data-type='img'][data-drawnix-embed='true'] .drawnix-preview-toolbar {
     position: absolute;
     top: 8px;
-    left: calc(8px + var(--drawnix-label-width, 0px) + var(--drawnix-toolbar-gap, 8px));
+    right: 8px;
     display: inline-flex;
     align-items: center;
     gap: 4px;
