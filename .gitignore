@@ -4,6 +4,7 @@
 Thumbs.db
 
 node_modules/
+.venv/
 dist/
 dev/
 build/
