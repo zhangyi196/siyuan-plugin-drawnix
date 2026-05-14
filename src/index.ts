@@ -50,6 +50,11 @@ const {
 } = PluginInfo
 
 const STORAGE_NAME = "config.json";
+const DRAWNIX_PREVIEW_BLOCK_ATTR = "data-drawnix-preview-block";
+const DRAWNIX_NATIVE_RESIZE_ATTR = "data-drawnix-native-resize";
+const DRAWNIX_NATIVE_ACTION_ATTR = "data-drawnix-native-action";
+const DRAWNIX_PREVIEW_INSET = 8;
+const DRAWNIX_PREVIEW_TOOLBAR_GAP = 8;
 
 // Type definitions
 interface DrawnixImageInfo {
@@ -89,6 +94,9 @@ export default class DrawnixPlugin extends Plugin {
   private _openMenuImageHandler;
   private _globalKeyDownHandler;
   private _mouseOverHandler;
+  private _drawnixPreviewDragStartHandler;
+  private _drawnixPreviewPointerDownHandler;
+  private _drawnixPreviewMouseDownHandler;
   private isMouseOverProcessing = false;
   private fullLabelRefreshTimer: number | null = null;
 
@@ -137,6 +145,15 @@ export default class DrawnixPlugin extends Plugin {
     this._mouseOverHandler = this.mouseOverHandler.bind(this);
     document.addEventListener("mouseover", this._mouseOverHandler);
 
+    this._drawnixPreviewDragStartHandler = this.drawnixPreviewDragStartHandler.bind(this);
+    document.addEventListener("dragstart", this._drawnixPreviewDragStartHandler, true);
+
+    this._drawnixPreviewPointerDownHandler = this.drawnixPreviewPointerDownHandler.bind(this);
+    document.addEventListener("pointerdown", this._drawnixPreviewPointerDownHandler, true);
+
+    this._drawnixPreviewMouseDownHandler = this.drawnixPreviewMouseDownHandler.bind(this);
+    document.addEventListener("mousedown", this._drawnixPreviewMouseDownHandler, true);
+
     this.reloadAllEditor();
   }
 
@@ -145,6 +162,9 @@ export default class DrawnixPlugin extends Plugin {
     if (this._openMenuImageHandler) this.eventBus.off("open-menu-image", this._openMenuImageHandler);
     if (this._globalKeyDownHandler) document.documentElement.removeEventListener("keydown", this._globalKeyDownHandler);
     if (this._mouseOverHandler) document.removeEventListener("mouseover", this._mouseOverHandler);
+    if (this._drawnixPreviewDragStartHandler) document.removeEventListener("dragstart", this._drawnixPreviewDragStartHandler, true);
+    if (this._drawnixPreviewPointerDownHandler) document.removeEventListener("pointerdown", this._drawnixPreviewPointerDownHandler, true);
+    if (this._drawnixPreviewMouseDownHandler) document.removeEventListener("mousedown", this._drawnixPreviewMouseDownHandler, true);
     this.reloadAllEditor();
     this.removeAllDrawnixTab();
   }
@@ -309,7 +329,15 @@ export default class DrawnixPlugin extends Plugin {
 
       const hasRelevantMutation = mutations.some((mutation) => {
         if (mutation.type === 'attributes') {
-          return true;
+          if (!(mutation.target instanceof Element)) {
+            return false;
+          }
+
+          if (mutation.attributeName === 'custom-drawnix') {
+            return mutation.target.matches("div[data-type='NodeParagraph']");
+          }
+
+          return mutation.target.matches(".img[data-type='img'], img");
         }
 
         if (!(mutation.target instanceof Element) || !mutation.target.closest("div[data-type='NodeParagraph']")) {
@@ -330,7 +358,7 @@ export default class DrawnixPlugin extends Plugin {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["data-src", "src", "custom-drawnix"],
+      attributeFilter: ["data-src", "src", "custom-drawnix", "style", "width", "height"],
     });
 
     return mutationObserver;
@@ -514,11 +542,327 @@ export default class DrawnixPlugin extends Plugin {
     }
   }
 
+  private getDrawnixPreviewBlock(target: EventTarget | null): HTMLElement | null {
+    if (!(target instanceof Element)) return null;
+    return target.closest(`div[data-type='NodeParagraph'][${DRAWNIX_PREVIEW_BLOCK_ATTR}='true']`) as HTMLElement | null;
+  }
+
+  private getDrawnixPreviewContainerFromBlock(blockElement: HTMLElement | null): HTMLDivElement | null {
+    if (!blockElement) return null;
+    return blockElement.querySelector(".img[data-type='img'][data-drawnix-embed='true']") as HTMLDivElement | null;
+  }
+
+  private getDrawnixPreviewContainer(target: EventTarget | null): HTMLDivElement | null {
+    const blockElement = this.getDrawnixPreviewBlock(target);
+    if (blockElement) {
+      return this.getDrawnixPreviewContainerFromBlock(blockElement);
+    }
+
+    if (!(target instanceof Element)) return null;
+    return target.closest(".img[data-type='img'][data-drawnix-embed='true']") as HTMLDivElement | null;
+  }
+
+  private getDrawnixImageURLFromContainer(imgContainer: HTMLDivElement | null): string {
+    const imageElement = imgContainer?.querySelector("img") as HTMLImageElement | null;
+    return imageElement?.getAttribute("data-src") || imageElement?.getAttribute("src") || "";
+  }
+
+  private getDrawnixNativeAction(imgContainer: HTMLDivElement | null): HTMLElement | null {
+    return imgContainer?.querySelector(".protyle-action") as HTMLElement | null;
+  }
+
+  private getDrawnixNativeMenuTrigger(imgContainer: HTMLDivElement | null): HTMLElement | null {
+    const nativeAction = this.getDrawnixNativeAction(imgContainer);
+    if (!nativeAction) return null;
+    return nativeAction.querySelector(".protyle-icon") as HTMLElement | null;
+  }
+
+  private resetDrawnixPreviewElementSize(element: HTMLElement | null) {
+    if (!element) return;
+    ["width", "height", "min-width", "max-width", "min-height", "max-height"].forEach((property) => {
+      element.style.removeProperty(property);
+    });
+    element.removeAttribute("width");
+    element.removeAttribute("height");
+  }
+
+  private normalizeDrawnixPreviewContainer(imgContainer: HTMLDivElement) {
+    this.resetDrawnixPreviewElementSize(imgContainer);
+
+    const imageElement = imgContainer.querySelector("img") as HTMLImageElement | null;
+    this.resetDrawnixPreviewElementSize(imageElement);
+    if (imageElement) {
+      imageElement.draggable = false;
+      imageElement.setAttribute("draggable", "false");
+    }
+  }
+
+  private getDrawnixToolbarMoreIconHTML(imgContainer: HTMLDivElement | null): string {
+    const nativeMenuTrigger = this.getDrawnixNativeMenuTrigger(imgContainer);
+    if (nativeMenuTrigger?.innerHTML?.trim()) {
+      return nativeMenuTrigger.innerHTML;
+    }
+
+    return '<svg class="svg" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="1.8"></circle><circle cx="12" cy="12" r="1.8"></circle><circle cx="12" cy="19" r="1.8"></circle></svg>';
+  }
+
+  private createDrawnixPreviewToolbarButton(className: string, ariaLabel: string, iconHTML: string) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `protyle-icon protyle-icon--only protyle-custom drawnix-preview-toolbar__button ${className}`;
+    button.setAttribute("aria-label", ariaLabel);
+    button.title = ariaLabel;
+    button.innerHTML = iconHTML;
+    return button;
+  }
+
+  private openDrawnixEditorForBlock(imageURL: string, blockElement: HTMLElement) {
+    if (!imageURL) return;
+
+    this.getDrawnixImageInfo(imageURL, blockElement).then((imageInfo) => {
+      if (!imageInfo) return;
+
+      if (!this.isMobile && this.data[STORAGE_NAME].editWindow === 'tab') {
+        this.openEditTab(imageInfo);
+      } else {
+        this.openEditDialog(imageInfo);
+      }
+    });
+  }
+
+  private triggerDrawnixNativeMenu(imgContainer: HTMLDivElement, anchorButton: HTMLElement) {
+    const anchorRect = anchorButton.getBoundingClientRect();
+    const clientX = anchorRect.left + anchorRect.width / 2;
+    const clientY = anchorRect.top + anchorRect.height / 2;
+    const nativeMenuTrigger = this.getDrawnixNativeMenuTrigger(imgContainer);
+
+    if (nativeMenuTrigger) {
+      ["mousedown", "mouseup", "click"].forEach((eventName) => {
+        nativeMenuTrigger.dispatchEvent(new MouseEvent(eventName, {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX,
+          clientY,
+          button: 0,
+        }));
+      });
+      return;
+    }
+
+    const fallbackTarget = (imgContainer.querySelector("img") as HTMLImageElement | null) || imgContainer;
+    fallbackTarget.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX,
+      clientY,
+      button: 2,
+    }));
+  }
+
+  private measureDrawnixLabelWidth(imgContainer: HTMLDivElement, labelText: string) {
+    if (!labelText) return 0;
+
+    const measureElement = document.createElement("span");
+    const computedStyle = window.getComputedStyle(imgContainer);
+    measureElement.textContent = labelText;
+    measureElement.style.position = "fixed";
+    measureElement.style.left = "-100000px";
+    measureElement.style.top = "0";
+    measureElement.style.visibility = "hidden";
+    measureElement.style.pointerEvents = "none";
+    measureElement.style.whiteSpace = "nowrap";
+    measureElement.style.padding = "2px 8px";
+    measureElement.style.border = "1px solid transparent";
+    measureElement.style.borderRadius = "6px";
+    measureElement.style.boxSizing = "border-box";
+    measureElement.style.font = computedStyle.font;
+    measureElement.style.lineHeight = "1.4";
+    document.body.appendChild(measureElement);
+    const width = Math.ceil(measureElement.getBoundingClientRect().width);
+    measureElement.remove();
+    return width;
+  }
+
+  private updateDrawnixPreviewLayoutMetrics(imgContainer: HTMLDivElement) {
+    const toolbar = imgContainer.querySelector(".drawnix-preview-toolbar") as HTMLElement | null;
+    const toolbarWidth = Math.ceil(toolbar?.getBoundingClientRect().width || 0);
+    const maxLabelWidth = Math.max(
+      0,
+      imgContainer.clientWidth - DRAWNIX_PREVIEW_INSET * 2 - DRAWNIX_PREVIEW_TOOLBAR_GAP - toolbarWidth,
+    );
+    const labelText = imgContainer.getAttribute("data-drawnix-label") || "";
+    const labelWidth = Math.min(this.measureDrawnixLabelWidth(imgContainer, labelText), maxLabelWidth);
+
+    imgContainer.style.setProperty("--drawnix-toolbar-width", `${toolbarWidth}px`);
+    imgContainer.style.setProperty("--drawnix-label-width", `${labelWidth}px`);
+  }
+
+  private ensureDrawnixPreviewToolbar(blockElement: HTMLElement, imgContainer: HTMLDivElement, imageURL: string) {
+    let toolbar = imgContainer.querySelector(".drawnix-preview-toolbar") as HTMLDivElement | null;
+    if (!toolbar) {
+      toolbar = document.createElement("div");
+      toolbar.className = "drawnix-preview-toolbar";
+
+      const editButton = this.createDrawnixPreviewToolbarButton(
+        "drawnix-preview-toolbar__button--edit",
+        this.i18n.edit || "Edit Drawnix",
+        '<svg class="svg"><use xlink:href="#iconEdit"></use></svg>',
+      );
+      editButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const currentImageURL = toolbar?.dataset.imageUrl || this.getDrawnixImageURLFromContainer(imgContainer);
+        this.openDrawnixEditorForBlock(currentImageURL, blockElement);
+      });
+
+      const moreButton = this.createDrawnixPreviewToolbarButton(
+        "drawnix-preview-toolbar__button--more",
+        this.getI18nText("more", "更多"),
+        this.getDrawnixToolbarMoreIconHTML(imgContainer),
+      );
+      moreButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.triggerDrawnixNativeMenu(imgContainer, moreButton);
+      });
+
+      toolbar.append(editButton, moreButton);
+      imgContainer.appendChild(toolbar);
+    }
+
+    toolbar.dataset.imageUrl = imageURL;
+    const moreButton = toolbar.querySelector(".drawnix-preview-toolbar__button--more") as HTMLButtonElement | null;
+    if (moreButton) {
+      moreButton.innerHTML = this.getDrawnixToolbarMoreIconHTML(imgContainer);
+    }
+    return toolbar;
+  }
+
+  private refreshDrawnixNativeArtifacts(blockElement: HTMLElement, imgContainer: HTMLDivElement) {
+    blockElement.setAttribute(DRAWNIX_PREVIEW_BLOCK_ATTR, "true");
+    blockElement.querySelectorAll(`[${DRAWNIX_NATIVE_RESIZE_ATTR}]`).forEach((element) => {
+      element.removeAttribute(DRAWNIX_NATIVE_RESIZE_ATTR);
+    });
+    blockElement.querySelectorAll(`[${DRAWNIX_NATIVE_ACTION_ATTR}]`).forEach((element) => {
+      element.removeAttribute(DRAWNIX_NATIVE_ACTION_ATTR);
+    });
+
+    const toolbar = imgContainer.querySelector(".drawnix-preview-toolbar") as HTMLElement | null;
+    const nativeAction = this.getDrawnixNativeAction(imgContainer);
+    if (nativeAction) {
+      nativeAction.setAttribute(DRAWNIX_NATIVE_ACTION_ATTR, "true");
+    }
+
+    blockElement.querySelectorAll("*").forEach((node) => {
+      const element = node as HTMLElement;
+      if (element === imgContainer || element === toolbar || toolbar?.contains(element)) return;
+      if (nativeAction && (element === nativeAction || nativeAction.contains(element))) return;
+      if (!element.isConnected) return;
+
+      const classText = [
+        typeof element.className === "string" ? element.className : "",
+        element.getAttribute("data-type") || "",
+        element.getAttribute("data-position") || "",
+      ].join(" ").toLowerCase();
+      const cursor = window.getComputedStyle(element).cursor.toLowerCase();
+
+      if (classText.includes("resize") || cursor.includes("resize")) {
+        element.setAttribute(DRAWNIX_NATIVE_RESIZE_ATTR, "true");
+      }
+    });
+  }
+
+  private syncDrawnixPreviewBlockUI(blockElement: HTMLElement, imgContainer: HTMLDivElement, imageURL: string) {
+    blockElement.setAttribute(DRAWNIX_PREVIEW_BLOCK_ATTR, "true");
+    this.normalizeDrawnixPreviewContainer(imgContainer);
+    this.ensureDrawnixPreviewToolbar(blockElement, imgContainer, imageURL);
+    this.refreshDrawnixNativeArtifacts(blockElement, imgContainer);
+    this.updateDrawnixPreviewLayoutMetrics(imgContainer);
+
+    window.requestAnimationFrame(() => {
+      if (!blockElement.isConnected || !imgContainer.isConnected) return;
+      this.refreshDrawnixNativeArtifacts(blockElement, imgContainer);
+      this.updateDrawnixPreviewLayoutMetrics(imgContainer);
+    });
+  }
+
+  private drawnixPreviewDragStartHandler(event: DragEvent) {
+    const blockElement = this.getDrawnixPreviewBlock(event.target);
+    const imgContainer = this.getDrawnixPreviewContainer(event.target);
+    if (!blockElement || !imgContainer) return;
+
+    const target = event.target as HTMLElement | null;
+    if (target?.closest(".drawnix-preview-toolbar, .drawnix-preview-toolbar__button, button, a")) {
+      return;
+    }
+
+    const isNativeResize = !!target?.closest(`[${DRAWNIX_NATIVE_RESIZE_ATTR}='true']`);
+    if (!isNativeResize) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+  }
+
+  private shouldBypassDrawnixPreviewBlock(target: HTMLElement | null) {
+    return !!target?.closest(".drawnix-preview-toolbar, .drawnix-preview-toolbar__button, button, a");
+  }
+
+  private blockDrawnixPreviewPointerEvent(event: MouseEvent | PointerEvent) {
+    const blockElement = this.getDrawnixPreviewBlock(event.target);
+    if (!blockElement) return;
+
+    const target = event.target as HTMLElement | null;
+    if (this.shouldBypassDrawnixPreviewBlock(target)) {
+      return;
+    }
+
+    if ('button' in event && event.button !== 0) {
+      return;
+    }
+
+    const imgContainer = this.getDrawnixPreviewContainerFromBlock(blockElement);
+    const isNativeResize = !!target?.closest(`[${DRAWNIX_NATIVE_RESIZE_ATTR}='true']`);
+    const isInsidePreview = !!imgContainer && !!target && (target === imgContainer || imgContainer.contains(target));
+
+    if (!isNativeResize && !isInsidePreview) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+  }
+
+  private drawnixPreviewPointerDownHandler(event: PointerEvent) {
+    this.blockDrawnixPreviewPointerEvent(event);
+  }
+
+  private drawnixPreviewMouseDownHandler(event: MouseEvent) {
+    this.blockDrawnixPreviewPointerEvent(event);
+  }
+
   private clearDrawnixLabel(blockElement: HTMLElement) {
+    blockElement.removeAttribute(DRAWNIX_PREVIEW_BLOCK_ATTR);
+    blockElement.querySelectorAll(`[${DRAWNIX_NATIVE_RESIZE_ATTR}]`).forEach((element) => {
+      element.removeAttribute(DRAWNIX_NATIVE_RESIZE_ATTR);
+    });
+    blockElement.querySelectorAll(`[${DRAWNIX_NATIVE_ACTION_ATTR}]`).forEach((element) => {
+      element.removeAttribute(DRAWNIX_NATIVE_ACTION_ATTR);
+    });
+    blockElement.querySelectorAll(".drawnix-preview-toolbar").forEach((toolbarElement) => {
+      toolbarElement.remove();
+    });
+
     const imgContainer = blockElement.querySelector(".img[data-type='img']") as HTMLDivElement;
     if (imgContainer) {
+      imgContainer.removeAttribute("data-drawnix-embed");
       imgContainer.removeAttribute("data-drawnix-label");
       imgContainer.removeAttribute("data-drawnix-label-mode");
+      imgContainer.style.removeProperty("--drawnix-label-width");
+      imgContainer.style.removeProperty("--drawnix-toolbar-width");
     }
 
     blockElement.querySelectorAll(".label--embed-drawnix").forEach((labelElement) => {
@@ -530,9 +874,24 @@ export default class DrawnixPlugin extends Plugin {
   }
 
   private clearAllDrawnixLabels(root: ParentNode = document) {
+    root.querySelectorAll(`[${DRAWNIX_PREVIEW_BLOCK_ATTR}]`).forEach((blockElement) => {
+      (blockElement as HTMLElement).removeAttribute(DRAWNIX_PREVIEW_BLOCK_ATTR);
+    });
+    root.querySelectorAll(`[${DRAWNIX_NATIVE_RESIZE_ATTR}]`).forEach((element) => {
+      (element as HTMLElement).removeAttribute(DRAWNIX_NATIVE_RESIZE_ATTR);
+    });
+    root.querySelectorAll(`[${DRAWNIX_NATIVE_ACTION_ATTR}]`).forEach((element) => {
+      (element as HTMLElement).removeAttribute(DRAWNIX_NATIVE_ACTION_ATTR);
+    });
+    root.querySelectorAll(".drawnix-preview-toolbar").forEach((toolbarElement) => {
+      toolbarElement.remove();
+    });
     root.querySelectorAll(".img[data-type='img']").forEach((containerElement) => {
+      (containerElement as HTMLDivElement).removeAttribute("data-drawnix-embed");
       (containerElement as HTMLDivElement).removeAttribute("data-drawnix-label");
       (containerElement as HTMLDivElement).removeAttribute("data-drawnix-label-mode");
+      (containerElement as HTMLDivElement).style.removeProperty("--drawnix-label-width");
+      (containerElement as HTMLDivElement).style.removeProperty("--drawnix-toolbar-width");
     });
     root.querySelectorAll(".label--embed-drawnix").forEach((labelElement) => {
       labelElement.remove();
@@ -572,11 +931,6 @@ export default class DrawnixPlugin extends Plugin {
 
   private async refreshAllDrawnixLabels() {
     this.clearAllDrawnixLabels();
-
-    if (this.data[STORAGE_NAME].labelDisplay === "noLabel") {
-      return;
-    }
-
     const blockElements = this.collectDrawnixLabelBlocks();
     await Promise.allSettled(blockElements.map((blockElement) => this.syncDrawnixLabel(blockElement)));
   }
@@ -588,8 +942,16 @@ export default class DrawnixPlugin extends Plugin {
     const imageElement = imgContainer?.querySelector("img") as HTMLImageElement;
     const imageURL = imageElement?.getAttribute("data-src") || imageElement?.getAttribute("src") || "";
 
-    if (this.data[STORAGE_NAME].labelDisplay === "noLabel" || !imgContainer || !this.isDrawnixAssetURL(imageURL)) {
+    if (!imgContainer || !this.isDrawnixAssetURL(imageURL)) {
       this.clearDrawnixLabel(blockElement);
+      return;
+    }
+
+    this.clearDrawnixLabel(blockElement);
+    imgContainer.setAttribute("data-drawnix-embed", "true");
+    this.syncDrawnixPreviewBlockUI(blockElement, imgContainer, imageURL);
+
+    if (this.data[STORAGE_NAME].labelDisplay === "noLabel") {
       return;
     }
 
@@ -597,7 +959,6 @@ export default class DrawnixPlugin extends Plugin {
     if (!blockElement.isConnected) return;
 
     if (!imageInfo) {
-      this.clearDrawnixLabel(blockElement);
       return;
     }
 
@@ -608,70 +969,36 @@ export default class DrawnixPlugin extends Plugin {
     this.clearDrawnixLabel(blockElement);
 
     if (!imageInfo) return;
-    if (this.data[STORAGE_NAME].labelDisplay === "noLabel") return;
 
     const imgContainer = blockElement.querySelector(".img[data-type='img']") as HTMLDivElement;
     if (!imgContainer) return;
+
+    imgContainer.setAttribute("data-drawnix-embed", "true");
+    const imageURL = this.getDrawnixImageURLFromContainer(imgContainer);
+    this.syncDrawnixPreviewBlockUI(blockElement, imgContainer, imageURL);
+    if (this.data[STORAGE_NAME].labelDisplay === "noLabel") return;
 
     const displayName = this.getDrawnixDisplayName(imageInfo);
     const labelMode = this.data[STORAGE_NAME].labelDisplay === "showLabelAlways" ? "always" : "hover";
     imgContainer.setAttribute("data-drawnix-label", displayName);
     imgContainer.setAttribute("data-drawnix-label-mode", labelMode);
+    this.updateDrawnixPreviewLayoutMetrics(imgContainer);
   }
 
   private mouseOverHandler(e: MouseEvent) {
     const target = e.target as HTMLElement;
-    const imgContainer = target.closest('[data-type="img"]');
-    if (!imgContainer || this.isMouseOverProcessing) return;
+    const blockElement = target.closest(`div[data-type='NodeParagraph'][${DRAWNIX_PREVIEW_BLOCK_ATTR}='true']`) as HTMLElement | null;
+    if (!blockElement || this.isMouseOverProcessing) return;
 
     this.isMouseOverProcessing = true;
     setTimeout(() => this.isMouseOverProcessing = false, 100);
 
-    if (imgContainer.querySelector('.cst-edit-drawnix')) return;
-
-    const blockElement = imgContainer.closest('[data-node-id]') as HTMLElement;
-    if (!blockElement) return;
-
-    const imgElement = imgContainer.querySelector('img') as HTMLImageElement;
-    const imageURL = imgElement?.getAttribute("data-src") || imgElement?.getAttribute("src") || '';
+    const imgContainer = this.getDrawnixPreviewContainerFromBlock(blockElement);
+    const imageURL = this.getDrawnixImageURLFromContainer(imgContainer);
     if (!this.isDrawnixAssetURL(imageURL)) return;
 
-    const action = imgContainer.querySelector('.protyle-action');
-    if (!action) return;
-
-    // Adjust original icon style
-    const actionIcon = action.querySelector('.protyle-icon') as HTMLElement;
-    if (actionIcon) {
-      actionIcon.style.borderTopLeftRadius = '0';
-      actionIcon.style.borderBottomLeftRadius = '0';
-    }
-
-    // Insert "Edit" button
-    const editBtnHtml = `
-            <span class="protyle-icon protyle-icon--only protyle-custom cst-edit-drawnix" 
-                  aria-label="${this.i18n.edit || 'Edit Drawnix'}"
-                  style="border-top-right-radius:0;border-bottom-right-radius:0;cursor:pointer;">
-                <svg class="svg"><use xlink:href="#iconEdit"></use></svg>
-            </span>`;
-    action.insertAdjacentHTML('afterbegin', editBtnHtml);
-
-    // Bind click event
-    const editBtn = imgContainer.querySelector('.cst-edit-drawnix');
-    editBtn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-
-      if (imageURL) {
-        this.getDrawnixImageInfo(imageURL, blockElement).then((imageInfo) => {
-          if (imageInfo) {
-            if (!this.isMobile && this.data[STORAGE_NAME].editWindow === 'tab') {
-              this.openEditTab(imageInfo);
-            } else {
-              this.openEditDialog(imageInfo);
-            }
-          }
-        });
-      }
-    });
+    if (!imgContainer) return;
+    this.syncDrawnixPreviewBlockUI(blockElement, imgContainer, imageURL);
   }
 
   private openMenuImageHandler({ detail }) {
@@ -687,11 +1014,7 @@ export default class DrawnixPlugin extends Plugin {
           label: `编辑 Drawnix`,
           index: 1,
           click: () => {
-            if (!this.isMobile && this.data[STORAGE_NAME].editWindow === 'tab') {
-              this.openEditTab(imageInfo);
-            } else {
-              this.openEditDialog(imageInfo);
-            }
+            this.openDrawnixEditorForBlock(imageURL, blockElement);
           }
         });
       }
@@ -770,18 +1093,22 @@ export default class DrawnixPlugin extends Plugin {
     }
   }
 
-  private requestDrawnixSource(iframe: HTMLIFrameElement): Promise<any> {
+  private requestDrawnixPayload<T>(
+    iframe: HTMLIFrameElement,
+    requestType: 'export-source' | 'export-preview-svg',
+    timeoutMessage: string,
+  ): Promise<T> {
     return new Promise((resolve, reject) => {
       if (!iframe.contentWindow) {
         reject(new Error('Drawnix iframe is not ready'));
         return;
       }
 
-      const requestId = `xmind-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const requestId = `drawnix-${requestType}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const timeout = window.setTimeout(() => {
         cleanup();
-        reject(new Error('Drawnix source export timed out'));
-      }, 3000);
+        reject(new Error(timeoutMessage));
+      }, 5000);
 
       const cleanup = () => {
         window.clearTimeout(timeout);
@@ -792,18 +1119,332 @@ export default class DrawnixPlugin extends Plugin {
         if (event.source !== iframe.contentWindow) return;
 
         const message = this.parseMessageData(event.data);
-        if (message?.type !== 'export-source' || message.requestId !== requestId) return;
+        if (message?.type !== requestType || message.requestId !== requestId) return;
 
         cleanup();
-        resolve(message.data);
+        resolve(message.data as T);
       };
 
       window.addEventListener('message', messageEventHandler);
       iframe.contentWindow.postMessage({
-        type: 'export-source',
+        type: requestType,
         requestId,
       }, '*');
     });
+  }
+
+  private requestDrawnixSource(iframe: HTMLIFrameElement): Promise<any> {
+    return this.requestDrawnixPayload<any>(
+      iframe,
+      'export-source',
+      'Drawnix source export timed out',
+    );
+  }
+
+  private requestDrawnixPreviewSVG(iframe: HTMLIFrameElement): Promise<string> {
+    return this.requestDrawnixPayload<string>(
+      iframe,
+      'export-preview-svg',
+      'Drawnix preview export timed out',
+    );
+  }
+
+  private decodeSvgDataURL(svgDataURL: string): string {
+    const [prefix, payload = ''] = svgDataURL.split(',', 2);
+    if (prefix.includes(';base64')) {
+      return base64ToUnicode(payload);
+    }
+
+    try {
+      return decodeURIComponent(payload);
+    } catch {
+      return payload;
+    }
+  }
+
+  private encodeSvgDataURL(svgContent: string): string {
+    return `data:image/svg+xml;base64,${unicodeToBase64(svgContent)}`;
+  }
+
+  private parseSvgViewBox(svgElement: SVGSVGElement) {
+    const viewBoxAttr = svgElement.getAttribute('viewBox') || '';
+    const viewBoxValues = viewBoxAttr
+      .trim()
+      .split(/[\s,]+/)
+      .map((value) => Number.parseFloat(value))
+      .filter((value) => Number.isFinite(value));
+
+    if (viewBoxValues.length === 4 && viewBoxValues[2] > 0 && viewBoxValues[3] > 0) {
+      return {
+        x: viewBoxValues[0],
+        y: viewBoxValues[1],
+        width: viewBoxValues[2],
+        height: viewBoxValues[3],
+      };
+    }
+
+    const width = Number.parseFloat(svgElement.getAttribute('width') || '0') || 1;
+    const height = Number.parseFloat(svgElement.getAttribute('height') || '0') || 1;
+    return {
+      x: 0,
+      y: 0,
+      width: Math.max(width, 1),
+      height: Math.max(height, 1),
+    };
+  }
+
+  private getSvgMeasureSize(width: number, height: number) {
+    const maxSize = 1200;
+    if (width <= 0 || height <= 0) {
+      return { width: maxSize, height: maxSize };
+    }
+
+    if (width >= height) {
+      return {
+        width: maxSize,
+        height: Math.max(1, Math.round((height / width) * maxSize)),
+      };
+    }
+
+    return {
+      width: Math.max(1, Math.round((width / height) * maxSize)),
+      height: maxSize,
+    };
+  }
+
+  private isFullCanvasBackgroundRect(
+    element: SVGGraphicsElement,
+    svgElement: SVGSVGElement,
+    viewBox: { x: number; y: number; width: number; height: number },
+  ) {
+    if (element.tagName.toLowerCase() !== 'rect') return false;
+    if (element.parentElement !== svgElement) return false;
+
+    const x = Number.parseFloat(element.getAttribute('x') || '0') || 0;
+    const y = Number.parseFloat(element.getAttribute('y') || '0') || 0;
+    const widthAttr = element.getAttribute('width') || '';
+    const heightAttr = element.getAttribute('height') || '';
+    const width = widthAttr.trim().endsWith('%')
+      ? viewBox.width
+      : Number.parseFloat(widthAttr || '0') || 0;
+    const height = heightAttr.trim().endsWith('%')
+      ? viewBox.height
+      : Number.parseFloat(heightAttr || '0') || 0;
+
+    const fill = (element.getAttribute('fill') || window.getComputedStyle(element).fill || '').trim().toLowerCase();
+    const stroke = (element.getAttribute('stroke') || window.getComputedStyle(element).stroke || '').trim().toLowerCase();
+    const isLightBackground = [
+      '#fff',
+      '#ffffff',
+      'white',
+      'rgb(255, 255, 255)',
+      'rgba(255, 255, 255, 1)',
+      'transparent',
+      'rgba(0, 0, 0, 0)',
+    ].includes(fill);
+    const hasNoStroke = !stroke || stroke === 'none' || stroke === 'transparent' || stroke === 'rgba(0, 0, 0, 0)';
+    const coversCanvas = Math.abs(x - viewBox.x) <= 1
+      && Math.abs(y - viewBox.y) <= 1
+      && Math.abs(width - viewBox.width) <= 2
+      && Math.abs(height - viewBox.height) <= 2;
+
+    return coversCanvas && isLightBackground && hasNoStroke;
+  }
+
+  private shouldIgnorePreviewGraphic(
+    element: SVGGraphicsElement,
+    svgElement: SVGSVGElement,
+    viewBox: { x: number; y: number; width: number; height: number },
+  ) {
+    if (element.closest('defs, clipPath, mask, marker, pattern, symbol')) {
+      return true;
+    }
+
+    if (this.isFullCanvasBackgroundRect(element, svgElement, viewBox)) {
+      return true;
+    }
+
+    const computedStyle = window.getComputedStyle(element);
+    if (computedStyle.display === 'none' || computedStyle.visibility === 'hidden') {
+      return true;
+    }
+
+    const opacity = Number.parseFloat(computedStyle.opacity || '1');
+    if (Number.isFinite(opacity) && opacity <= 0) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private async cropSvgDataURLToContent(svgDataURL: string): Promise<string> {
+    if (!svgDataURL.startsWith('data:image/svg+xml')) {
+      return svgDataURL;
+    }
+
+    const svgContent = this.decodeSvgDataURL(svgDataURL);
+    const svgDocument = new DOMParser().parseFromString(svgContent, 'image/svg+xml');
+    const sourceSvgElement = svgDocument.documentElement as SVGSVGElement;
+    if (!sourceSvgElement || sourceSvgElement.tagName.toLowerCase() !== 'svg') {
+      return svgDataURL;
+    }
+
+    const viewBox = this.parseSvgViewBox(sourceSvgElement);
+    const workingSvgElement = sourceSvgElement.cloneNode(true) as SVGSVGElement;
+    workingSvgElement.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    workingSvgElement.setAttribute('viewBox', `${viewBox.x} ${viewBox.y} ${viewBox.width} ${viewBox.height}`);
+    workingSvgElement.setAttribute('preserveAspectRatio', workingSvgElement.getAttribute('preserveAspectRatio') || 'xMidYMid meet');
+
+    const measureSize = this.getSvgMeasureSize(viewBox.width, viewBox.height);
+    workingSvgElement.setAttribute('width', `${measureSize.width}`);
+    workingSvgElement.setAttribute('height', `${measureSize.height}`);
+
+    const host = document.createElement('div');
+    host.style.position = 'fixed';
+    host.style.left = '-100000px';
+    host.style.top = '0';
+    host.style.width = `${measureSize.width}px`;
+    host.style.height = `${measureSize.height}px`;
+    host.style.overflow = 'hidden';
+    host.style.opacity = '0';
+    host.style.pointerEvents = 'none';
+    host.style.zIndex = '-1';
+    host.appendChild(workingSvgElement);
+    document.body.appendChild(host);
+
+    try {
+      await new Promise<void>((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+      });
+
+      const rootRect = workingSvgElement.getBoundingClientRect();
+      if (!rootRect.width || !rootRect.height) {
+        return svgDataURL;
+      }
+
+      const scaleX = viewBox.width / rootRect.width;
+      const scaleY = viewBox.height / rootRect.height;
+      const graphicElements = Array.from(
+        workingSvgElement.querySelectorAll('path, rect, circle, ellipse, line, polyline, polygon, text, image, foreignObject, use'),
+      ) as SVGGraphicsElement[];
+
+      let minX = Number.POSITIVE_INFINITY;
+      let minY = Number.POSITIVE_INFINITY;
+      let maxX = Number.NEGATIVE_INFINITY;
+      let maxY = Number.NEGATIVE_INFINITY;
+
+      graphicElements.forEach((graphicElement) => {
+        if (this.shouldIgnorePreviewGraphic(graphicElement, workingSvgElement, viewBox)) {
+          return;
+        }
+
+        const rect = graphicElement.getBoundingClientRect();
+        if (rect.width < 0.5 && rect.height < 0.5) {
+          return;
+        }
+
+        const left = viewBox.x + (rect.left - rootRect.left) * scaleX;
+        const top = viewBox.y + (rect.top - rootRect.top) * scaleY;
+        const right = left + rect.width * scaleX;
+        const bottom = top + rect.height * scaleY;
+
+        minX = Math.min(minX, left);
+        minY = Math.min(minY, top);
+        maxX = Math.max(maxX, right);
+        maxY = Math.max(maxY, bottom);
+      });
+
+      if (![minX, minY, maxX, maxY].every((value) => Number.isFinite(value))) {
+        return svgDataURL;
+      }
+
+      const padding = Math.max(16, Math.min(32, Math.min(viewBox.width, viewBox.height) * 0.03));
+      const cropX = Math.max(viewBox.x, minX - padding);
+      const cropY = Math.max(viewBox.y, minY - padding);
+      const cropRight = Math.min(viewBox.x + viewBox.width, maxX + padding);
+      const cropBottom = Math.min(viewBox.y + viewBox.height, maxY + padding);
+      const cropWidth = Math.max(1, cropRight - cropX);
+      const cropHeight = Math.max(1, cropBottom - cropY);
+
+      sourceSvgElement.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+      sourceSvgElement.setAttribute('viewBox', `${cropX} ${cropY} ${cropWidth} ${cropHeight}`);
+      sourceSvgElement.setAttribute('width', `${Math.round(cropWidth)}`);
+      sourceSvgElement.setAttribute('height', `${Math.round(cropHeight)}`);
+      sourceSvgElement.setAttribute('preserveAspectRatio', sourceSvgElement.getAttribute('preserveAspectRatio') || 'xMidYMid meet');
+
+      return this.encodeSvgDataURL(new XMLSerializer().serializeToString(sourceSvgElement));
+    } catch (err) {
+      console.error('Failed to crop Drawnix SVG preview', err);
+      return svgDataURL;
+    } finally {
+      host.remove();
+    }
+  }
+
+  private async svgDataURLToPngDataURL(svgDataURL: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => {
+        const width = Math.max(1, Math.round(image.naturalWidth || image.width || 1));
+        const height = Math.max(1, Math.round(image.naturalHeight || image.height || 1));
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+
+        const context = canvas.getContext('2d');
+        if (!context) {
+          reject(new Error('Failed to create preview canvas context'));
+          return;
+        }
+
+        context.fillStyle = '#ffffff';
+        context.fillRect(0, 0, width, height);
+        context.drawImage(image, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      image.onerror = () => reject(new Error('Failed to rasterize Drawnix SVG preview'));
+      image.src = svgDataURL;
+    });
+  }
+
+  private async buildDrawnixPreviewImageData(
+    iframe: HTMLIFrameElement,
+    format: DrawnixImageInfo['format'],
+  ) {
+    const rawSvgDataURL = await this.requestDrawnixPreviewSVG(iframe);
+    const normalizedSvgDataURL = this.fixImageContent(rawSvgDataURL);
+    const croppedSvgDataURL = await this.cropSvgDataURLToContent(normalizedSvgDataURL);
+
+    if (format === 'png') {
+      const pngDataURL = await this.svgDataURLToPngDataURL(croppedSvgDataURL);
+      return this.fixImageContent(pngDataURL);
+    }
+
+    return this.fixImageContent(croppedSvgDataURL);
+  }
+
+  private async refreshRenderedDrawnixImage(imageURL: string) {
+    try {
+      await fetch(imageURL, { cache: 'reload' });
+    } catch (err) {
+      console.warn('Failed to reload Drawnix image cache', err);
+    }
+
+    document.querySelectorAll(`img[data-src='${imageURL}']`).forEach((imageElement) => {
+      (imageElement as HTMLImageElement).src = imageURL;
+    });
+    this.scheduleFullDrawnixLabelRefresh(0);
+  }
+
+  private async persistDrawnixPreviewImage(
+    iframe: HTMLIFrameElement,
+    imageInfo: DrawnixImageInfo,
+    afterSave?: () => void,
+  ) {
+    imageInfo.data = await this.buildDrawnixPreviewImageData(iframe, imageInfo.format);
+    await this.updateDrawnixImage(imageInfo);
+    afterSave?.();
+    await this.refreshRenderedDrawnixImage(imageInfo.imageURL);
   }
 
   private downloadTextFile(fileName: string, content: string, mimeType: string) {
@@ -1288,16 +1929,16 @@ export default class DrawnixPlugin extends Plugin {
           setTimeout(addFullscreenButton, 100);
         }
 
-        const onSave = (message: any) => {
+        const onSave = async (message: any) => {
           // Drawnix 会返回保存的数据
           if (message.data) {
             imageInfo.drawnixData = JSON.stringify(message.data);
           }
-          // 请求导出图片
-          postMessage({
-            type: 'export',
-            format: imageInfo.format
-          });
+          try {
+            await that.persistDrawnixPreviewImage(iframe, imageInfo);
+          } catch (err) {
+            console.error('[Tab] Failed to persist Drawnix preview image', err);
+          }
           // 给思源发送保存通知（仅手动保存时）
           if (message.type === 'save') {
             try {
@@ -1305,22 +1946,6 @@ export default class DrawnixPlugin extends Plugin {
             } catch (err) {
               console.error('Failed to send save notification', err);
             }
-          }
-        }
-
-        const onExport = (message: any) => {
-          if (message.format == imageInfo.format && message.data) {
-            imageInfo.data = message.data;
-
-            that.updateDrawnixImage(imageInfo, () => {
-              // 更新页面上的图片
-              fetch(imageInfo.imageURL, { cache: 'reload' }).then(() => {
-                document.querySelectorAll(`img[data-src='${imageInfo.imageURL}']`).forEach(imageElement => {
-                  (imageElement as HTMLImageElement).src = imageInfo.imageURL;
-                });
-                that.scheduleFullDrawnixLabelRefresh(0);
-              });
-            });
           }
         }
 
@@ -1340,10 +1965,7 @@ export default class DrawnixPlugin extends Plugin {
                 onInit();
               }
               else if (message.type == "save" || message.type == "autosave") {
-                onSave(message);
-              }
-              else if (message.type == "export") {
-                onExport(message);
+                void onSave(message);
               }
               else if (message.type == "exit") {
                 onExit(message);
@@ -1553,14 +2175,21 @@ export default class DrawnixPlugin extends Plugin {
       }
     }
 
-    const onSave = (message: any) => {
+    const onSave = async (message: any) => {
       if (message.data) {
         imageInfo.drawnixData = JSON.stringify(message.data);
       }
-      postMessage({
-        type: 'export',
-        format: imageInfo.format,
-      });
+      try {
+        await this.persistDrawnixPreviewImage(iframe, imageInfo, () => {
+          postMessage({
+            action: 'status',
+            messageKey: 'allChangesSaved',
+            modified: false
+          });
+        });
+      } catch (err) {
+        console.error('[Dialog] Failed to persist Drawnix preview image', err);
+      }
       // 给思源发送保存通知（仅手动保存时）
       if (message.type === 'save') {
         try {
@@ -1568,28 +2197,6 @@ export default class DrawnixPlugin extends Plugin {
         } catch (err) {
           console.error('Failed to send save notification', err);
         }
-      }
-    }
-
-    const onExport = (message: any) => {
-      if (message.format == imageInfo.format && message.data) {
-        imageInfo.data = message.data;
-        imageInfo.data = this.fixImageContent(imageInfo.data);
-
-        this.updateDrawnixImage(imageInfo, () => {
-          postMessage({
-            action: 'status',
-            messageKey: 'allChangesSaved',
-            modified: false
-          });
-          fetch(imageInfo.imageURL, { cache: 'reload' }).then(() => {
-            document.querySelectorAll(`img[data-src='${imageInfo.imageURL}']`).forEach(imageElement => {
-              (imageElement as HTMLImageElement).src = imageInfo.imageURL;
-            });
-            this.scheduleFullDrawnixLabelRefresh(0);
-            // (已改为立即打开标签页 — 不在这里处理)
-          });
-        });
       }
     }
 
@@ -1613,10 +2220,7 @@ export default class DrawnixPlugin extends Plugin {
             onInit();
           }
           else if (message.type == "save" || message.type == "autosave") {
-            onSave(message);
-          }
-          else if (message.type == "export") {
-            onExport(message);
+            void onSave(message);
           }
           else if (message.type == "exit") {
             onExit(message);

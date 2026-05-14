@@ -53,6 +53,17 @@
                         data: latestData
                     }, '*');
                     break;
+                case 'export-preview-svg':
+                    if (window.drawnixApi) {
+                        window.drawnixApi.exportImage('svg').then(data => {
+                            window.parent.postMessage({
+                                type: 'export-preview-svg',
+                                requestId: message.requestId,
+                                data: data
+                            }, '*');
+                        });
+                    }
+                    break;
             }
         });
 
